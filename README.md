@@ -1,57 +1,84 @@
 # picha
 
-Quick Share for Linux, from the terminal: share from your Android phone and the
-file lands on your laptop — no app on the phone. *Yo te picho*, like the cheve
-at a carne asada.
+Your Android phone and your Linux laptop, like Huawei Share — from the terminal,
+in the look of the [discada](https://github.com/daniiiqa/dotfiles) rice. *Yo te
+picho*, like the cheve at a carne asada.
 
 ```
-$ picha
-picha: visible as "hachikuji" (:34431) · saving to ~/Downloads
-picha: S21 de Dany te picha foto.jpg (2.1 MB · PIN 4821)
-picha: accepted
-picha: 100% (2.1 MB)
-picha: Received foto.jpg → ~/Downloads
+picha                  the menu: send · receive · phone screen · lumbre
+picha foto.jpg …       send it to the phone
+picha pantalla         the phone's screen here
 ```
 
-On the phone: **Share → Quick Share** and pick your laptop. picha asks through a
-desktop notification (Accept / Reject) showing the same PIN as the phone. Links
-open or copy, text goes to the clipboard.
+- **Receive** what the phone shares: on the phone, **Share → Quick Share** (Wi-Fi,
+  fast) or **Share → Bluetooth** (no network needed) and pick the laptop. A
+  notification asks (Aceptar · Rechazar · Siempre); files go to Downloads, links
+  open or copy, text goes to the clipboard. "Siempre" trusts that phone from then on.
+- **Send** to the phone: picha nudges it over Bluetooth LE, then uses Quick Share at
+  Wi-Fi speed when it answers, Bluetooth to the paired phone when not. The phone
+  asks to accept.
+- **The phone's screen** (scrcpy over Android's Wireless debugging or the cable):
+  the clipboard goes both ways, drag files onto it to put them on the phone.
+- **Lumbre**: when there's no network, the laptop makes its own Wi-Fi; the menu
+  shows a QR the phone's camera joins with.
+- **Hide** from the Recibir page, for networks you don't trust.
 
-## Status
-
-- ✅ Receiving files, links and text over Wi-Fi (phone and laptop on the same network),
-  tested with a Galaxy S21 on One UI 7
-- ✅ Receiving over Bluetooth with no network at all: Share → Bluetooth from a paired
-  phone (needs `bluez-obex`; slower, fine for photos and documents)
-- ✅ "Always from this phone": trusted phones skip the prompt (`picha confianza`, `picha olvida`)
-- ⏳ Sending to the phone (the protocol side exists; Android only listens after a
-  Bluetooth LE nudge, which is next)
+The menu (and every page) follows the look's `[style]` the way rola, vato and
+fierro do — borders, bars, labels, case, selection, tint — and restyles when the
+look changes. Without discada it uses sensible defaults and the terminal's colors.
 
 ## Install
 
 ```sh
 cargo install --path . --root ~/.local
-picha            # stays visible while it runs
 ```
+
+Needs: BlueZ with `bluez-obex` (Bluetooth), NetworkManager (lumbre), and for the
+phone's screen `scrcpy` and `android-tools`. Optional: `taco` (picks files for
+sending), `wl-clipboard` (text to the clipboard).
+
+The receiver runs in the background:
+
+```sh
+picha recibe                     # e.g. exec-once in Hyprland
+# or: install -Dm644 dist/picha-recibe.service ~/.config/systemd/user/ && systemctl --user enable --now picha-recibe
+```
+
+### The phone, once
+
+- **Bluetooth**: pair it with the laptop (for sending, and receiving without a network).
+- **Phone screen**: Developer options → Wireless debugging → *Pair device with
+  pairing code*, then `picha pantalla --empareja`. Or plug in the cable: picha
+  turns Wireless debugging back on through it when Samsung switches it off.
+
+## Config
 
 `~/.config/picha/config.json` (all optional):
 
 ```json
-{ "name": "hachikuji", "dir": "~/Downloads", "lang": "es" }
+{ "name": "hachikuji", "dir": "~/Downloads", "lang": "es", "trusted": ["Daniel's S21"] }
 ```
 
 ## How it works
 
-picha advertises the `_FC9F5ED42C8A._tcp` mDNS service Android's share sheet looks
-for, then speaks Nearby Share: a UKEY2 key exchange (P-256), an AES-256-CBC +
-HMAC-SHA256 channel, and the Nearby Connections / Sharing frames inside it.
+Receiving speaks Google's Nearby Share as the server: an mDNS service Android's
+share sheet looks for, a UKEY2 key exchange (P-256), an AES-256-CBC + HMAC-SHA256
+channel and the Nearby Connections / Sharing frames inside it. Sending is the same
+as the client, after the BLE advertisement Android waits for. Bluetooth transfers
+go through BlueZ's obexd; the phone's screen is scrcpy.
 
 Built from [NearDrop](https://github.com/grishka/NearDrop)'s protocol write-up
-(thank you, @grishka). The protobuf definitions in `proto/` are Google's (Apache 2.0).
+(thank you, @grishka) and Google's open-source
+[Nearby Connections](https://github.com/google/nearby); the protobuf definitions in
+`proto/` are Google's (Apache 2.0). Notes on Quick Share without any network:
+[docs/quick-share-sin-red.md](docs/quick-share-sin-red.md).
+
+Tested with a Galaxy S21 (Android 15, One UI 7).
 
 ```sh
-cargo test                        # crypto, framing, and full transfers over TCP
-cargo run --example browse        # list Quick Share devices on the network
+cargo test                        # crypto, framing and whole transfers over TCP
+cargo run --example browse        # Quick Share devices on the network
+cargo run --example nudge         # nudge phones and watch who answers
 ```
 
 ## License
