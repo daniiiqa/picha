@@ -314,10 +314,11 @@ async fn ask(offer: &Offer, lang: Lang) -> Answer {
     }
     let body = parts.join(" · ");
     println!("picha: {title} ({body})");
+    // short: arre puts the buttons on one line and drops what doesn't fit
     let actions = [
         ("accept", lang.t("Aceptar", "Accept")),
-        ("always", lang.t("Siempre de este cel", "Always from this phone")),
         ("reject", lang.t("Rechazar", "Reject")),
+        ("always", lang.t("Siempre", "Always")),
     ];
     match notify_for(&title, &body, &actions, ASK_TIMEOUT).await.as_deref() {
         Some("accept") => Answer::Accept,
