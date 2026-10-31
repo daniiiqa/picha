@@ -95,6 +95,12 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("picha: {e}");
+            // from a keybind nobody sees stderr
+            if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                let _ = std::process::Command::new("notify-send")
+                    .args(["-a", "picha", "-i", "smartphone-symbolic", "picha", &e.to_string()])
+                    .status();
+            }
             ExitCode::FAILURE
         }
     }
