@@ -8,4 +8,5 @@ pub mod pantalla;
 pub mod proto;
 pub mod receive;
 pub mod send;
+pub mod state;
 pub mod wire;

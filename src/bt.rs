@@ -147,3 +147,89 @@ pub async fn receive(dir: PathBuf, events: mpsc::Sender<Event>) -> Result<Receiv
     manager.call::<_, _, ()>("RegisterAgent", &(path,)).await.map_err(err)?;
     Ok(Receiver { _session: session })
 }
+
+/// A paired phone that takes Bluetooth file pushes.
+#[derive(Debug, Clone)]
+pub struct Phone {
+    pub name: String,
+    pub address: String,
+    pub connected: bool,
+    /// What it reports over Bluetooth (hands-free battery level), when it does.
+    pub battery: Option<u8>,
+}
+
+/// Paired devices offering OBEX Object Push, the connected ones first.
+pub async fn phones() -> Vec<Phone> {
+    let Ok(system) = Connection::system().await else { return Vec::new() };
+    let Ok(om) = fdo::ObjectManagerProxy::builder(&system).destination("org.bluez").and_then(|b| b.path("/")) else {
+        return Vec::new();
+    };
+    let Ok(om) = om.build().await else { return Vec::new() };
+    let Ok(objects) = om.get_managed_objects().await else { return Vec::new() };
+    let mut found: Vec<Phone> = objects
+        .into_values()
+        .filter_map(|ifaces| {
+            let dev = ifaces.get("org.bluez.Device1")?;
+            let get = |k: &str| dev.get(k);
+            let paired = get("Paired").and_then(|v| bool::try_from(v).ok()).unwrap_or(false);
+            let uuids: Vec<String> = get("UUIDs").and_then(|v| Vec::<String>::try_from(v.try_clone().ok()?).ok()).unwrap_or_default();
+            if !paired || !uuids.iter().any(|u| u.starts_with("00001105")) {
+                return None;
+            }
+            let text = |k: &str| get(k).and_then(|v| String::try_from(v.try_clone().ok()?).ok()).unwrap_or_default();
+            let battery = ifaces.get("org.bluez.Battery1").and_then(|b| b.get("Percentage")).and_then(|v| u8::try_from(v).ok());
+            Some(Phone {
+                name: text("Alias"),
+                address: text("Address"),
+                connected: get("Connected").and_then(|v| bool::try_from(v).ok()).unwrap_or(false),
+                battery,
+            })
+        })
+        .collect();
+    found.sort_by_key(|p| !p.connected);
+    found
+}
+
+/// Progress of a send: (file index, bytes of that file sent, its size).
+pub type SendProgress = (usize, u64, u64);
+
+/// Pushes `files` to a paired phone over Bluetooth, one after another. The phone
+/// asks its user to accept each one.
+pub async fn send(address: &str, files: &[PathBuf], progress: mpsc::Sender<SendProgress>) -> Result<()> {
+    use std::collections::HashMap;
+    use zbus::zvariant::Value;
+    let err = |e: zbus::Error| protocol(format!("Bluetooth: {e}"));
+    let session = Connection::session().await.map_err(err)?;
+    let client = Proxy::new(&session, OBEX, "/org/bluez/obex", "org.bluez.obex.Client1").await.map_err(err)?;
+    let mut args: HashMap<&str, Value> = HashMap::new();
+    args.insert("Target", Value::from("opp"));
+    let obex_session: OwnedObjectPath = client.call("CreateSession", &(address, args)).await.map_err(err)?;
+    let result = async {
+        let push = Proxy::new(&session, OBEX, obex_session.as_str(), "org.bluez.obex.ObjectPush1").await.map_err(err)?;
+        for (i, file) in files.iter().enumerate() {
+            let path = std::fs::canonicalize(file).map_err(crate::error::Error::Io)?;
+            let (transfer, _props): (OwnedObjectPath, HashMap<String, zbus::zvariant::OwnedValue>) =
+                push.call("SendFile", &(path.to_string_lossy().as_ref(),)).await.map_err(err)?;
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            loop {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let t = transfer.as_str();
+                let status: zbus::Result<String> = property(&session, OBEX, t, "org.bluez.obex.Transfer1", "Status").await;
+                let sent: u64 = property(&session, OBEX, t, "org.bluez.obex.Transfer1", "Transferred").await.unwrap_or(0);
+                let _ = progress.try_send((i, sent, size));
+                match status.as_deref() {
+                    Ok("complete") => break,
+                    Ok("error") => return Err(protocol("the phone declined or the transfer failed")),
+                    Ok(_) => {}
+                    // the transfer object goes away as soon as it ends
+                    Err(_) => break,
+                }
+            }
+            let _ = progress.try_send((i, size, size));
+        }
+        Ok(())
+    }
+    .await;
+    let _ = client.call::<_, _, ()>("RemoveSession", &(obex_session,)).await;
+    result
+}

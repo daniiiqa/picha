@@ -24,8 +24,15 @@ const ASK_TIMEOUT: Duration = Duration::from_secs(15);
 const INFO_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
-#[command(name = "picha", version, about = "Quick Share for Linux: your phone te picha files, a la carne asada")]
+#[command(
+    name = "picha",
+    version,
+    about = "Your phone and your laptop, a la carne asada: picha opens the menu, picha foto.jpg sends it to the phone",
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
+    /// Files to send to the phone
+    files: Vec<PathBuf>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -77,6 +84,19 @@ impl Lang {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let config = Config::load();
+    let lang = Lang(config.spanish());
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    // in a terminal: the menu, or sending; without one (Hyprland's startup): receiving
+    if cli.cmd.is_none() && (interactive || !cli.files.is_empty()) {
+        let start = if cli.files.is_empty() { tui::Start::Menu } else { tui::Start::Send(cli.files) };
+        return match tui::run(tui::Lang(lang.0), start).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("picha: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let result = match cli.cmd.unwrap_or(Cmd::Recibe { dir: None }) {
         Cmd::Recibe { dir } => receive_forever(&config, dir.unwrap_or_else(|| config.dir())).await,
         Cmd::Pantalla { addr, empareja, audio, apagada, ya } => pantalla(Lang(config.spanish()), addr, empareja, audio, apagada, ya).await,
@@ -120,6 +140,7 @@ async fn receive_forever(config: &Config, dir: PathBuf) -> Result<()> {
     let me = Endpoint { name: config.name(), kind: DeviceKind::Laptop };
     let id = wire::stable_endpoint_id(&format!("{}/{}", Config::hostname(), me.name));
     let _advert = mdns::advertise(&me, &id, &Config::hostname(), port)?;
+    let _mark = picha::state::ReceiverMark::new();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     println!(
         "picha: {} \"{}\" (:{port}) · {} {}",
@@ -175,11 +196,13 @@ async fn one_transfer(stream: TcpStream, dir: PathBuf, lang: Lang) {
 async fn serve_events(mut events: mpsc::Receiver<Event>, lang: Lang) -> bool {
     let mut shown = 0;
     let mut offered = false;
+    let mut from = String::new();
     while let Some(event) = events.recv().await {
         match event {
             Event::Offer(offer, answer) => {
                 offered = true;
                 shown = 0;
+                from = offer.from.name.clone();
                 let accepted = if Config::load().is_trusted(&offer.trust_key()) {
                     println!("picha: {} · {}", offer.from.name, lang.t("de confianza, aceptado solo", "trusted, accepted automatically"));
                     true
@@ -205,6 +228,7 @@ async fn serve_events(mut events: mpsc::Receiver<Event>, lang: Lang) -> bool {
             }
             // Their notifications wait for a click; don't hold the connection for them.
             Event::Files(paths) => {
+                picha::state::record(&from, &paths);
                 tokio::spawn(files_arrived(paths, lang));
             }
             Event::Text(kind, text) => {
@@ -239,7 +263,7 @@ async fn pantalla(lang: Lang, addr: Option<String>, empareja: bool, audio: bool,
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
     if !ya && interactive {
-        return Ok(tui::run(tui::Lang(lang.0), addr, audio, screen_off).await?);
+        return Ok(tui::run(tui::Lang(lang.0), tui::Start::Screen { addr, audio, screen_off }).await?);
     }
     let link = pantalla::reach(addr).await.map_err(|why| {
         Error::Protocol(why.unwrap_or_else(|| lang.t("no encontré el cel", "no phone found").into()))
