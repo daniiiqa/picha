@@ -1,3 +1,5 @@
+mod tui;
+
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
 use std::time::Duration;
@@ -213,182 +215,41 @@ async fn serve_events(mut events: mpsc::Receiver<Event>, lang: Lang) -> bool {
     offered
 }
 
-/// The phone's card in discada's look, then its window (scrcpy, detached so the
-/// terminal can close). Failures get a card too: from the keybind it's all you see.
+/// `picha pantalla`: pairing (if asked) in plain prompts, then the TUI that finds
+/// the phone and opens its screen when the user picks it; `--ya` skips the TUI.
 async fn pantalla(lang: Lang, addr: Option<String>, empareja: bool, audio: bool, screen_off: bool, ya: bool) -> Result<()> {
-    use picha::look::{Look, Tone};
-    let Err(e) = pantalla_card(lang, addr, empareja, audio, screen_off, ya).await else { return Ok(()) };
-    let look = Look::load();
-    let msg = match &e {
-        picha::error::Error::Protocol(m) => m.clone(),
-        other => other.to_string(),
-    };
-    // «what · how · how»: the first part stands out, the rest are the ways out
-    let mut parts = msg.split(" · ");
-    let mut rows = vec![vec![(Tone::Warn, parts.next().unwrap_or_default().to_string())]];
-    rows.extend(parts.map(|p| vec![(Tone::Muted, p.to_string())]));
-    rows.push(Vec::new());
-    rows.push(vec![(Tone::Muted, lang.t("enter para cerrar", "enter to close").to_string())]);
-    print!("{}", look.card(&format!("picha · {}", lang.t("pantalla", "screen")), &rows));
-    std::process::exit(1);
-}
-
-async fn pantalla_card(lang: Lang, addr: Option<String>, empareja: bool, audio: bool, screen_off: bool, ya: bool) -> Result<()> {
     use picha::look::{Look, Tone};
     use picha::pantalla;
 
-    let look = Look::load();
-    let say = |tone: Tone, text: &str| println!(" {}", look.paint(tone, text));
-    let fail = |msg: &str| picha::error::Error::Protocol(msg.to_string());
-
     if empareja {
-        say(Tone::Muted, lang.t(
+        let look = Look::load();
+        println!(" {}", look.paint(Tone::Muted, lang.t(
             "en el cel: Opciones de desarrollador → Depuración inalámbrica → Vincular con código…",
             "on the phone: Developer options → Wireless debugging → Pair device with pairing code…",
-        ));
-        let addr = pantalla::find(pantalla::PAIRING, Duration::from_secs(90))?
-            .ok_or_else(|| fail(lang.t("no apareció el cel", "the phone didn't show up")))?;
+        )));
+        let found = pantalla::find(pantalla::PAIRING, Duration::from_secs(90))?;
+        let pair_addr = found.ok_or_else(|| Error::Protocol(lang.t("no apareció el cel", "the phone didn't show up").into()))?;
         print!(" {} ", look.paint(Tone::Primary, lang.t("código de 6 dígitos:", "6-digit code:")));
         std::io::Write::flush(&mut std::io::stdout())?;
         let mut code = String::new();
         std::io::stdin().read_line(&mut code)?;
-        pantalla::pair(&addr, code.trim())?;
-        say(Tone::Accent, lang.t("emparejado", "paired"));
+        pantalla::pair(&pair_addr, code.trim())?;
+        println!(" {}", look.paint(Tone::Accent, lang.t("emparejado", "paired")));
     }
 
-    // a given address; the cable (which also re-arms Wireless debugging) or a phone
-    // already connected; the last address; a new port on the last IP; an announcement
-    let mut via_cable = false;
-    let serial = match addr {
-        Some(addr) => pantalla::connect(&addr)?,
-        None => match pantalla::ready_devices()?.into_iter().next() {
-            Some(serial) => {
-                via_cable = pantalla::is_usb(&serial);
-                serial
-            }
-            None => {
-                say(Tone::Muted, lang.t("buscando el cel…", "looking for the phone…"));
-                let last = pantalla::last_address();
-                let mut found = last.as_deref().and_then(|a| pantalla::connect(a).ok());
-                if found.is_none()
-                    && let Some(ip) = last.as_deref().and_then(|a| a.rsplit_once(':')).map(|(ip, _)| ip.to_string()) {
-                        found = pantalla::probe(&ip).await;
-                    }
-                if found.is_none() {
-                    found = pantalla::find(pantalla::CONNECT, Duration::from_secs(4))?.and_then(|a| pantalla::connect(&a).ok());
-                }
-                found.ok_or_else(|| fail(lang.t(
-                    "no encontré el cel · prende Depuración inalámbrica · (búscala en Ajustes: «depuración inalámbrica») · o conecta el cable una vez",
-                    "no phone found · turn on Wireless debugging · (search \"wireless debugging\" in Settings) · or plug in the cable once",
-                )))?
-            }
-        },
-    };
-    // learn where Wireless debugging listens, from the phone itself
-    let wifi = if via_cable { pantalla::arm_wireless(&serial) } else { pantalla::wifi_address(&serial) };
-    if let Some(w) = &wifi {
-        pantalla::remember(w);
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if !ya && interactive {
+        return Ok(tui::run(tui::Lang(lang.0), addr, audio, screen_off).await?);
     }
-
-    let info = pantalla::info(&serial);
-    let mut system = vec![(Tone::Muted, format!("{} · Android {}", info.model, info.android))];
-    if let Some(v) = &info.one_ui {
-        system.push((Tone::Muted, format!(" · One UI {v}")));
+    let link = pantalla::reach(addr).await.map_err(|why| {
+        Error::Protocol(why.unwrap_or_else(|| lang.t("no encontré el cel", "no phone found").into()))
+    })?;
+    let info = pantalla::info(&link.serial);
+    if pantalla::open(&link.serial, &info.name, audio, screen_off) {
+        Ok(())
+    } else {
+        Err(Error::Protocol("scrcpy (sudo pacman -S scrcpy)".into()))
     }
-    let mut rows = vec![vec![(Tone::Primary, format!("󰄜  {}", info.name))], system, Vec::new()];
-    if let Some(level) = info.battery {
-        let mut row = vec![(Tone::Fg, format!("󰁹  {level}%"))];
-        if info.charging {
-            row.push((Tone::Accent, format!("  {}", lang.t("cargando", "charging"))));
-        }
-        if let Some(t) = info.temperature {
-            row.push((if t >= 40.0 { Tone::Warn } else { Tone::Muted }, format!("  {t:.0}°C")));
-        }
-        rows.push(row);
-    }
-    rows.push(match (via_cable, &wifi) {
-        (true, Some(w)) => vec![
-            (Tone::Fg, format!("󰕓  {}", lang.t("cable", "cable"))),
-            (Tone::Muted, format!("  · {} {w}", lang.t("Wi-Fi lista en", "Wi-Fi ready at"))),
-        ],
-        (true, None) => vec![(Tone::Fg, format!("󰕓  {}", lang.t("cable", "cable")))],
-        (false, _) => vec![
-            (Tone::Fg, format!("󰖩  Wi-Fi {}", wifi.as_deref().unwrap_or(&serial))),
-            (Tone::Muted, format!("  · {}", lang.t("cifrado", "encrypted"))),
-        ],
-    });
-    if let Some(free) = &info.free {
-        rows.push(vec![(Tone::Fg, format!("󰋊  {free} {}", lang.t("libres", "free")))]);
-    }
-    rows.push(Vec::new());
-    rows.push(vec![(Tone::Muted, lang.t("arrastra archivos a la ventana → Download del cel", "drag files onto the window → the phone's Download").to_string())]);
-    rows.push(vec![(Tone::Muted, lang.t("el portapapeles va y viene", "the clipboard goes both ways").to_string())]);
-    print!("{}", look.card(&format!("picha · {}", lang.t("pantalla", "screen")), &rows));
-
-    // the user opens it: enter, with the sound and the phone's own screen as chosen
-    let (mut audio, mut screen_off) = (audio, screen_off);
-    if !ya && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        loop {
-            let yes_no = |on: bool| if on { lang.t("sí", "on") } else { lang.t("no", "off") };
-            let key = |k: &str, what: String| format!("{} {}", look.paint(Tone::Primary, k), look.paint(Tone::Fg, &what));
-            let sep = look.paint(Tone::Muted, "  ·  ");
-            print!(
-                "\r\x1b[2K {}{sep}{}{sep}{}{sep}{}",
-                key("enter", lang.t("abrir", "open").into()),
-                key("a", format!("{} {}", lang.t("sonido", "sound"), yes_no(audio))),
-                key("o", format!(
-                    "{} {}",
-                    lang.t("pantalla del cel", "phone screen"),
-                    if screen_off { lang.t("apagada", "off") } else { lang.t("prendida", "on") }
-                )),
-                key("q", lang.t("salir", "quit").into()),
-            );
-            std::io::Write::flush(&mut std::io::stdout())?;
-            match read_key() {
-                Some(b'\r' | b'\n') => break,
-                Some(b'a' | b'A') => audio = !audio,
-                Some(b'o' | b'O') => screen_off = !screen_off,
-                // q, Esc, Ctrl+C, or no terminal to read from
-                Some(b'q' | b'Q' | 27 | 3) | None => {
-                    println!();
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
-        println!();
-    }
-
-    let child = std::process::Command::new("setsid")
-        .arg("-f")
-        .arg("scrcpy")
-        .args(pantalla::scrcpy_args(&serial, &info.name, audio, screen_off))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    match child {
-        Ok(s) if s.success() => {
-            say(Tone::Accent, lang.t("abriendo la pantalla…", "opening the screen…"));
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            Ok(())
-        }
-        Ok(_) | Err(_) => Err(fail("scrcpy (sudo pacman -S scrcpy)")),
-    }
-}
-
-/// One key from the terminal without waiting for Enter (raw mode on /dev/tty).
-fn read_key() -> Option<u8> {
-    use std::io::Read;
-    let tty = std::fs::File::open("/dev/tty").ok()?;
-    let stty = |args: &[&str]| -> Option<()> {
-        std::process::Command::new("stty").args(args).stdin(tty.try_clone().ok()?).status().ok().filter(|s| s.success()).map(|_| ())
-    };
-    stty(&["raw", "-echo"])?;
-    let mut b = [0u8; 1];
-    let got = (&tty).read(&mut b).ok().filter(|n| *n == 1).map(|_| b[0]);
-    stty(&["sane"]);
-    got
 }
 
 fn size(bytes: u64) -> String {

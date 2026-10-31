@@ -170,7 +170,8 @@ pub fn arm_wireless(serial: &str) -> Option<String> {
     if shell(serial, "settings get global adb_wifi_enabled").trim() != "1" {
         shell(serial, "settings put global adb_wifi_enabled 1");
     }
-    (0..20).find_map(|_| {
+    // the announcement takes a moment to reach adb
+    (0..24).find_map(|_| {
         let addr = wifi_address(serial);
         if addr.is_none() {
             std::thread::sleep(Duration::from_millis(250));
@@ -202,6 +203,62 @@ pub async fn probe(ip: &str) -> Option<String> {
     }
     open.sort();
     open.into_iter().map(|port| format!("{ip}:{port}")).find(|addr| connect(addr).is_ok())
+}
+
+/// How the laptop reaches the phone this time.
+#[derive(Debug, Clone)]
+pub struct Link {
+    pub serial: String,
+    pub cable: bool,
+    /// Where Wireless debugging listens (remembered for next time).
+    pub wifi: Option<String>,
+}
+
+/// Finds the phone: a given address; one already connected (by cable, which also
+/// re-arms Wireless debugging, or Wi-Fi); the last address; a new port on the last
+/// IP; an announcement. `Err(None)`: no phone anywhere; `Err(Some(why))`: adb said no.
+pub async fn reach(addr: Option<String>) -> std::result::Result<Link, Option<String>> {
+    let err = |e: crate::error::Error| Some(e.to_string());
+    let (serial, cable) = match addr {
+        Some(addr) => (connect(&addr).map_err(err)?, false),
+        None => match ready_devices().map_err(err)?.into_iter().next() {
+            Some(serial) => {
+                let cable = is_usb(&serial);
+                (serial, cable)
+            }
+            None => {
+                let last = last_address();
+                let mut found = last.as_deref().and_then(|a| connect(a).ok());
+                if found.is_none()
+                    && let Some(ip) = last.as_deref().and_then(|a| a.rsplit_once(':')).map(|(ip, _)| ip.to_string())
+                {
+                    found = probe(&ip).await;
+                }
+                if found.is_none() {
+                    found = find(CONNECT, Duration::from_secs(4)).ok().flatten().and_then(|a| connect(&a).ok());
+                }
+                (found.ok_or(None)?, false)
+            }
+        },
+    };
+    let wifi = if cable { arm_wireless(&serial) } else { wifi_address(&serial) };
+    if let Some(w) = &wifi {
+        remember(w);
+    }
+    Ok(Link { serial, cable, wifi })
+}
+
+/// Opens the phone's window, detached so the terminal that asked can close.
+pub fn open(serial: &str, title: &str, audio: bool, screen_off: bool) -> bool {
+    Command::new("setsid")
+        .arg("-f")
+        .arg("scrcpy")
+        .args(scrcpy_args(serial, title, audio, screen_off))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// What the card before the phone's window shows.
