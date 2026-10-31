@@ -74,7 +74,7 @@ async fn main() -> ExitCode {
     let config = Config::load();
     let result = match cli.cmd.unwrap_or(Cmd::Recibe { dir: None }) {
         Cmd::Recibe { dir } => receive_forever(&config, dir.unwrap_or_else(|| config.dir())).await,
-        Cmd::Pantalla { addr, empareja, audio, apagada } => pantalla(Lang(config.spanish()), addr, empareja, audio, apagada),
+        Cmd::Pantalla { addr, empareja, audio, apagada } => pantalla(Lang(config.spanish()), addr, empareja, audio, apagada).await,
         Cmd::Confianza => {
             for phone in &config.trusted {
                 println!("{phone}");
@@ -210,61 +210,134 @@ async fn serve_events(mut events: mpsc::Receiver<Event>, lang: Lang) -> bool {
     offered
 }
 
-fn pantalla(lang: Lang, addr: Option<String>, empareja: bool, audio: bool, screen_off: bool) -> Result<()> {
+/// The phone's card in discada's look, then its window (scrcpy, detached so the
+/// terminal can close). Failures get a card too: from the keybind it's all you see.
+async fn pantalla(lang: Lang, addr: Option<String>, empareja: bool, audio: bool, screen_off: bool) -> Result<()> {
+    use picha::look::{Look, Tone};
+    let Err(e) = pantalla_card(lang, addr, empareja, audio, screen_off).await else { return Ok(()) };
+    let look = Look::load();
+    let msg = match &e {
+        picha::error::Error::Protocol(m) => m.clone(),
+        other => other.to_string(),
+    };
+    // «what · how · how»: the first part stands out, the rest are the ways out
+    let mut parts = msg.split(" · ");
+    let mut rows = vec![vec![(Tone::Warn, parts.next().unwrap_or_default().to_string())]];
+    rows.extend(parts.map(|p| vec![(Tone::Muted, p.to_string())]));
+    rows.push(Vec::new());
+    rows.push(vec![(Tone::Muted, lang.t("enter para cerrar", "enter to close").to_string())]);
+    print!("{}", look.card(&format!("picha · {}", lang.t("pantalla", "screen")), &rows));
+    std::process::exit(1);
+}
+
+async fn pantalla_card(lang: Lang, addr: Option<String>, empareja: bool, audio: bool, screen_off: bool) -> Result<()> {
+    use picha::look::{Look, Tone};
     use picha::pantalla;
-    use std::os::unix::process::CommandExt;
+
+    let look = Look::load();
+    let say = |tone: Tone, text: &str| println!(" {}", look.paint(tone, text));
+    let fail = |msg: &str| picha::error::Error::Protocol(msg.to_string());
 
     if empareja {
-        println!(
-            "picha: {}",
-            lang.t(
-                "en el cel: Opciones de desarrollador → Depuración inalámbrica → Vincular con código…",
-                "on the phone: Developer options → Wireless debugging → Pair device with pairing code…"
-            )
-        );
+        say(Tone::Muted, lang.t(
+            "en el cel: Opciones de desarrollador → Depuración inalámbrica → Vincular con código…",
+            "on the phone: Developer options → Wireless debugging → Pair device with pairing code…",
+        ));
         let addr = pantalla::find(pantalla::PAIRING, Duration::from_secs(90))?
-            .ok_or_else(|| picha::error::Error::Protocol(lang.t("no apareció el cel", "the phone didn't show up").into()))?;
-        print!("picha: {} ", lang.t("código de 6 dígitos:", "6-digit code:"));
+            .ok_or_else(|| fail(lang.t("no apareció el cel", "the phone didn't show up")))?;
+        print!(" {} ", look.paint(Tone::Primary, lang.t("código de 6 dígitos:", "6-digit code:")));
         std::io::Write::flush(&mut std::io::stdout())?;
         let mut code = String::new();
         std::io::stdin().read_line(&mut code)?;
         pantalla::pair(&addr, code.trim())?;
-        println!("picha: {}", lang.t("emparejado", "paired"));
+        say(Tone::Accent, lang.t("emparejado", "paired"));
     }
 
-    // a given address, the cable or a phone already connected, the last address,
-    // then whatever the phone announces
-    let ready = pantalla::ready_devices()?.into_iter().next();
-    let serial = match (addr, ready) {
-        (Some(addr), _) => pantalla::connect(&addr)?,
-        (None, Some(serial)) => serial,
-        (None, None) => {
-            let last = pantalla::last_address().and_then(|a| pantalla::connect(&a).ok());
-            match last {
-                Some(serial) => serial,
-                None => {
-                    println!("picha: {}", lang.t("buscando el cel…", "looking for the phone…"));
-                    let found = pantalla::find(pantalla::CONNECT, Duration::from_secs(8))?.ok_or_else(|| {
-                        picha::error::Error::Protocol(
-                            lang.t(
-                                "no encontré el cel: prende Depuración inalámbrica y pásame la «Dirección IP y puerto» que enseña (picha pantalla 192.168.1.20:41235), o conecta el cable",
-                                "no phone found: turn on Wireless debugging and give me the \"IP address & Port\" it shows (picha pantalla 192.168.1.20:41235), or plug in the cable",
-                            )
-                            .into(),
-                        )
-                    })?;
-                    pantalla::connect(&found)?
-                }
+    // a given address; the cable (which also re-arms Wireless debugging) or a phone
+    // already connected; the last address; a new port on the last IP; an announcement
+    let mut via_cable = false;
+    let serial = match addr {
+        Some(addr) => pantalla::connect(&addr)?,
+        None => match pantalla::ready_devices()?.into_iter().next() {
+            Some(serial) => {
+                via_cable = !serial.contains(':');
+                serial
             }
-        }
+            None => {
+                say(Tone::Muted, lang.t("buscando el cel…", "looking for the phone…"));
+                let last = pantalla::last_address();
+                let mut found = last.as_deref().and_then(|a| pantalla::connect(a).ok());
+                if found.is_none()
+                    && let Some(ip) = last.as_deref().and_then(|a| a.rsplit_once(':')).map(|(ip, _)| ip.to_string()) {
+                        found = pantalla::probe(&ip).await;
+                    }
+                if found.is_none() {
+                    found = pantalla::find(pantalla::CONNECT, Duration::from_secs(4))?.and_then(|a| pantalla::connect(&a).ok());
+                }
+                found.ok_or_else(|| fail(lang.t(
+                    "no encontré el cel · prende Depuración inalámbrica · (búscala en Ajustes: «depuración inalámbrica») · o conecta el cable una vez",
+                    "no phone found · turn on Wireless debugging · (search \"wireless debugging\" in Settings) · or plug in the cable once",
+                )))?
+            }
+        },
     };
-    if serial.contains(':') {
-        pantalla::remember(&serial);
+    // learn where Wireless debugging listens, from the phone itself
+    let wifi = if via_cable { pantalla::arm_wireless(&serial) } else { pantalla::wifi_address(&serial) };
+    if let Some(w) = &wifi {
+        pantalla::remember(w);
     }
-    let name = pantalla::phone_name(&serial);
-    println!("picha: {} {name}", lang.t("pantalla de", "screen of"));
-    let err = std::process::Command::new("scrcpy").args(pantalla::scrcpy_args(&serial, &name, audio, screen_off)).exec();
-    Err(picha::error::Error::Protocol(format!("scrcpy: {err}")))
+
+    let info = pantalla::info(&serial);
+    let mut system = vec![(Tone::Muted, format!("{} · Android {}", info.model, info.android))];
+    if let Some(v) = &info.one_ui {
+        system.push((Tone::Muted, format!(" · One UI {v}")));
+    }
+    let mut rows = vec![vec![(Tone::Primary, format!("󰄜  {}", info.name))], system, Vec::new()];
+    if let Some(level) = info.battery {
+        let mut row = vec![(Tone::Fg, format!("󰁹  {level}%"))];
+        if info.charging {
+            row.push((Tone::Accent, format!("  {}", lang.t("cargando", "charging"))));
+        }
+        if let Some(t) = info.temperature {
+            row.push((if t >= 40.0 { Tone::Warn } else { Tone::Muted }, format!("  {t:.0}°C")));
+        }
+        rows.push(row);
+    }
+    rows.push(match (via_cable, &wifi) {
+        (true, Some(w)) => vec![
+            (Tone::Fg, format!("󰕓  {}", lang.t("cable", "cable"))),
+            (Tone::Muted, format!("  · {} {w}", lang.t("Wi-Fi lista en", "Wi-Fi ready at"))),
+        ],
+        (true, None) => vec![(Tone::Fg, format!("󰕓  {}", lang.t("cable", "cable")))],
+        (false, _) => vec![
+            (Tone::Fg, format!("󰖩  Wi-Fi {serial}")),
+            (Tone::Muted, format!("  · {}", lang.t("cifrado", "encrypted"))),
+        ],
+    });
+    if let Some(free) = &info.free {
+        rows.push(vec![(Tone::Fg, format!("󰋊  {free} {}", lang.t("libres", "free")))]);
+    }
+    rows.push(Vec::new());
+    rows.push(vec![(Tone::Muted, lang.t("arrastra archivos a la ventana → Download del cel", "drag files onto the window → the phone's Download").to_string())]);
+    rows.push(vec![(Tone::Muted, lang.t("el portapapeles va y viene", "the clipboard goes both ways").to_string())]);
+    print!("{}", look.card(&format!("picha · {}", lang.t("pantalla", "screen")), &rows));
+
+    let child = std::process::Command::new("setsid")
+        .arg("-f")
+        .arg("scrcpy")
+        .args(pantalla::scrcpy_args(&serial, &info.name, audio, screen_off))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match child {
+        Ok(s) if s.success() => {
+            say(Tone::Accent, lang.t("abriendo la pantalla…", "opening the screen…"));
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            Ok(())
+        }
+        Ok(_) | Err(_) => Err(fail("scrcpy (sudo pacman -S scrcpy)")),
+    }
 }
 
 fn size(bytes: u64) -> String {

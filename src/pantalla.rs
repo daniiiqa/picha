@@ -124,6 +124,105 @@ pub fn scrcpy_args(serial: &str, title: &str, audio: bool, screen_off: bool) -> 
     args
 }
 
+fn shell(serial: &str, cmd: &str) -> String {
+    adb(&["-s", serial, "shell", cmd]).unwrap_or_default()
+}
+
+/// Where Wireless debugging listens right now (`ip:port`), asked of the phone
+/// itself: Samsung doesn't announce it while the screen is off.
+pub fn wifi_address(serial: &str) -> Option<String> {
+    let out = shell(serial, "getprop service.adb.tls.port; ip -f inet addr show wlan0");
+    let mut lines = out.lines();
+    let port: u16 = lines.next()?.trim().parse().ok().filter(|p| *p > 0)?;
+    let ip = lines.find_map(|l| l.trim().strip_prefix("inet "))?.split('/').next()?.to_string();
+    Some(format!("{ip}:{port}"))
+}
+
+/// Over the cable: turns Wireless debugging back on (Samsung switches it off on its
+/// own) and returns where it listens.
+pub fn arm_wireless(serial: &str) -> Option<String> {
+    if shell(serial, "settings get global adb_wifi_enabled").trim() != "1" {
+        shell(serial, "settings put global adb_wifi_enabled 1");
+    }
+    (0..20).find_map(|_| {
+        let addr = wifi_address(serial);
+        if addr.is_none() {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        addr
+    })
+}
+
+/// Wireless debugging moves to a new port each time it's switched on. Its open
+/// ports on the phone's last known IP are few: try adb on each.
+pub async fn probe(ip: &str) -> Option<String> {
+    use tokio::net::TcpStream;
+    use tokio::task::JoinSet;
+    use tokio::time::timeout;
+    let ip: IpAddr = ip.parse().ok()?;
+    let mut open = Vec::new();
+    // Android picks it from the ephemeral range
+    let ports: Vec<u16> = (30_000..=50_000).collect();
+    for batch in ports.chunks(2_000) {
+        let mut set = JoinSet::new();
+        for &port in batch {
+            set.spawn(async move {
+                matches!(timeout(Duration::from_millis(400), TcpStream::connect((ip, port))).await, Ok(Ok(_))).then_some(port)
+            });
+        }
+        while let Some(found) = set.join_next().await {
+            open.extend(found.ok().flatten());
+        }
+    }
+    open.sort();
+    open.into_iter().map(|port| format!("{ip}:{port}")).find(|addr| connect(addr).is_ok())
+}
+
+/// What the card before the phone's window shows.
+#[derive(Debug, Default)]
+pub struct Info {
+    pub name: String,
+    pub model: String,
+    pub android: String,
+    pub one_ui: Option<String>,
+    pub battery: Option<u8>,
+    pub charging: bool,
+    pub temperature: Option<f32>,
+    pub free: Option<String>,
+}
+
+pub fn info(serial: &str) -> Info {
+    const SEP: &str = "@@picha@@";
+    let out = shell(
+        serial,
+        &[
+            "settings get global device_name",
+            "getprop ro.product.model",
+            "getprop ro.build.version.release",
+            "getprop ro.build.version.oneui",
+            "dumpsys battery",
+            "df -h /data | tail -1",
+        ]
+        .join(&format!("; echo {SEP}; ")),
+    );
+    let parts: Vec<&str> = out.split(SEP).map(str::trim).collect();
+    let part = |i: usize| parts.get(i).copied().unwrap_or("");
+    let battery_field = |key: &str| part(4).lines().find_map(|l| l.trim().strip_prefix(key)).map(str::trim);
+    // One UI: 70000 → 7.0
+    let one_ui = part(3).parse::<u32>().ok().filter(|v| *v > 0).map(|v| format!("{}.{}", v / 10_000, v / 100 % 100));
+    Info {
+        name: Some(part(0)).filter(|s| !s.is_empty() && *s != "null").unwrap_or(part(1)).to_string(),
+        model: part(1).to_string(),
+        android: part(2).to_string(),
+        one_ui,
+        battery: battery_field("level:").and_then(|v| v.parse().ok()),
+        charging: ["AC powered:", "USB powered:", "Wireless powered:"].iter().any(|k| battery_field(k) == Some("true")),
+        temperature: battery_field("temperature:").and_then(|v| v.parse::<f32>().ok()).map(|t| t / 10.0),
+        // Filesystem Size Used Avail Use% Mounted
+        free: part(5).split_whitespace().nth(3).map(str::to_string),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
