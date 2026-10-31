@@ -1,0 +1,13 @@
+# Receive from phones in the background (Quick Share over Wi-Fi, and Bluetooth).
+#   install -Dm644 dist/picha-recibe.service ~/.config/systemd/user/picha-recibe.service
+#   systemctl --user enable --now picha-recibe
+[Unit]
+Description=picha: receive what phones share
+After=network-online.target bluetooth.target
+
+[Service]
+ExecStart=%h/.local/bin/picha recibe
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
