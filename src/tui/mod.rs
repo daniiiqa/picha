@@ -122,6 +122,9 @@ struct App {
     /// Clickable rows from the last draw.
     rows: Vec<(Rect, usize)>,
     note: Option<(String, bool)>,
+    /// Mandar opens taco (discada's explorer) to choose, when it's installed.
+    taco: bool,
+    want_taco: bool,
 }
 
 fn home() -> PathBuf {
@@ -201,6 +204,8 @@ impl App {
             found_tx,
             rows: Vec::new(),
             note: None,
+            taco: which("taco"),
+            want_taco: false,
         };
         app.load_phones();
         match start {
@@ -235,6 +240,11 @@ impl App {
             Page::Receive => {
                 self.recent = state::recent(8);
                 self.trusted = Config::load().trusted;
+            }
+            Page::Pick if self.taco => {
+                // taco runs in this same terminal; the main loop hands it over
+                self.page = Page::Menu;
+                self.want_taco = true;
             }
             Page::Pick => self.entries = list_dir(&self.dir),
             Page::Screen => self.search_screen(),
@@ -478,6 +488,33 @@ impl App {
     }
 }
 
+fn which(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(program).is_file()))
+}
+
+/// taco (discada's explorer) in choose mode, in this terminal: the files picked,
+/// starting where the last choice was made.
+fn choose_with_taco() -> Vec<PathBuf> {
+    let dir = state::dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let (out, cwd) = (dir.join("taco-elegidos"), dir.join("taco-carpeta"));
+    let _ = std::fs::remove_file(&out);
+    // where the last choice was made; the first time, the pictures folder
+    let pictures = std::fs::read_to_string(home().join(".config/user-dirs.dirs"))
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("XDG_PICTURES_DIR="))
+                .map(|v| PathBuf::from(v.trim_matches('"').replace("$HOME", &home().to_string_lossy())))
+        })
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(home);
+    let start = std::fs::read_to_string(&cwd).ok().map(PathBuf::from).filter(|p| p.is_dir()).unwrap_or(pictures);
+    let _ = std::process::Command::new("taco").arg(&start).arg("--choose").arg(&out).arg("--cwd-file").arg(&cwd).status();
+    std::fs::read_to_string(&out).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect()
+}
+
 /// Runs a future to completion from sync code inside the runtime.
 fn futures_block<F: std::future::Future>(f: F) -> F::Output {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
@@ -490,6 +527,18 @@ pub async fn run(lang: Lang, start: Start) -> io::Result<()> {
         let _ = execute!(io::stdout(), EnableMouseCapture);
         let result = (|| -> io::Result<()> {
             while !app.quit {
+                if std::mem::take(&mut app.want_taco) {
+                    // hand the terminal to taco, then take it back
+                    let _ = execute!(io::stdout(), DisableMouseCapture);
+                    ratatui::restore();
+                    let files = choose_with_taco();
+                    terminal = ratatui::init();
+                    let _ = execute!(io::stdout(), EnableMouseCapture);
+                    terminal.clear()?;
+                    if !files.is_empty() {
+                        app.send(files);
+                    }
+                }
                 if std::mem::take(&mut app.restyled) {
                     terminal.clear()?;
                 }
