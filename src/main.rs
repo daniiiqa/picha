@@ -36,6 +36,20 @@ enum Cmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// The phone's screen here (scrcpy): clipboard both ways, drag files onto it
+    Pantalla {
+        /// The phone's address from Wireless debugging ("IP address & Port"); remembered
+        addr: Option<String>,
+        /// Pair the phone first (once): Wireless debugging → Pair device with pairing code
+        #[arg(long)]
+        empareja: bool,
+        /// Play the phone's sound here too
+        #[arg(long)]
+        audio: bool,
+        /// Turn the phone's own screen off while it shows here
+        #[arg(long)]
+        apagada: bool,
+    },
     /// List the phones whose transfers are accepted without asking
     Confianza,
     /// Stop trusting a phone: its transfers ask again
@@ -60,6 +74,7 @@ async fn main() -> ExitCode {
     let config = Config::load();
     let result = match cli.cmd.unwrap_or(Cmd::Recibe { dir: None }) {
         Cmd::Recibe { dir } => receive_forever(&config, dir.unwrap_or_else(|| config.dir())).await,
+        Cmd::Pantalla { addr, empareja, audio, apagada } => pantalla(Lang(config.spanish()), addr, empareja, audio, apagada),
         Cmd::Confianza => {
             for phone in &config.trusted {
                 println!("{phone}");
@@ -187,6 +202,63 @@ async fn serve_events(mut events: mpsc::Receiver<Event>, lang: Lang) -> bool {
         }
     }
     offered
+}
+
+fn pantalla(lang: Lang, addr: Option<String>, empareja: bool, audio: bool, screen_off: bool) -> Result<()> {
+    use picha::pantalla;
+    use std::os::unix::process::CommandExt;
+
+    if empareja {
+        println!(
+            "picha: {}",
+            lang.t(
+                "en el cel: Opciones de desarrollador → Depuración inalámbrica → Vincular con código…",
+                "on the phone: Developer options → Wireless debugging → Pair device with pairing code…"
+            )
+        );
+        let addr = pantalla::find(pantalla::PAIRING, Duration::from_secs(90))?
+            .ok_or_else(|| picha::error::Error::Protocol(lang.t("no apareció el cel", "the phone didn't show up").into()))?;
+        print!("picha: {} ", lang.t("código de 6 dígitos:", "6-digit code:"));
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut code = String::new();
+        std::io::stdin().read_line(&mut code)?;
+        pantalla::pair(&addr, code.trim())?;
+        println!("picha: {}", lang.t("emparejado", "paired"));
+    }
+
+    // a given address, the cable or a phone already connected, the last address,
+    // then whatever the phone announces
+    let ready = pantalla::ready_devices()?.into_iter().next();
+    let serial = match (addr, ready) {
+        (Some(addr), _) => pantalla::connect(&addr)?,
+        (None, Some(serial)) => serial,
+        (None, None) => {
+            let last = pantalla::last_address().and_then(|a| pantalla::connect(&a).ok());
+            match last {
+                Some(serial) => serial,
+                None => {
+                    println!("picha: {}", lang.t("buscando el cel…", "looking for the phone…"));
+                    let found = pantalla::find(pantalla::CONNECT, Duration::from_secs(8))?.ok_or_else(|| {
+                        picha::error::Error::Protocol(
+                            lang.t(
+                                "no encontré el cel: prende Depuración inalámbrica y pásame la «Dirección IP y puerto» que enseña (picha pantalla 192.168.1.20:41235), o conecta el cable",
+                                "no phone found: turn on Wireless debugging and give me the \"IP address & Port\" it shows (picha pantalla 192.168.1.20:41235), or plug in the cable",
+                            )
+                            .into(),
+                        )
+                    })?;
+                    pantalla::connect(&found)?
+                }
+            }
+        }
+    };
+    if serial.contains(':') {
+        pantalla::remember(&serial);
+    }
+    let name = pantalla::phone_name(&serial);
+    println!("picha: {} {name}", lang.t("pantalla de", "screen of"));
+    let err = std::process::Command::new("scrcpy").args(pantalla::scrcpy_args(&serial, &name, audio, screen_off)).exec();
+    Err(picha::error::Error::Protocol(format!("scrcpy: {err}")))
 }
 
 fn size(bytes: u64) -> String {
