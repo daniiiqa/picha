@@ -1,0 +1,23 @@
+pkgbase = picha
+	pkgdesc = Your Android phone and your laptop, like Huawei Share: Quick Share, Bluetooth, its screen, from the terminal
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/daniiiqa/picha
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cargo
+	depends = gcc-libs
+	depends = glibc
+	depends = bluez
+	depends = bluez-obex
+	optdepends = networkmanager: lumbre, the laptop's own Wi-Fi when there is no network
+	optdepends = scrcpy: the phone's screen
+	optdepends = android-tools: the phone's screen (adb)
+	optdepends = wl-clipboard: received text to the clipboard
+	optdepends = libnotify: the accept prompt (notify-send)
+	optdepends = ttf-nerd-fonts-symbols: icons in the menu
+	source = picha-0.1.0.tar.gz::https://github.com/daniiiqa/picha/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = 57b75c912ef8b814e38d8371391f16afca9c4598dc5fc49fd789f29af32bae5a
+
+pkgname = picha

@@ -1,0 +1,47 @@
+# Maintainer: daniiiqa
+pkgname=picha
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Your Android phone and your laptop, like Huawei Share: Quick Share, Bluetooth, its screen, from the terminal'
+arch=('x86_64' 'aarch64')
+url='https://github.com/daniiiqa/picha'
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'bluez' 'bluez-obex')
+makedepends=('cargo')
+optdepends=(
+  'networkmanager: lumbre, the laptop'"'"'s own Wi-Fi when there is no network'
+  'scrcpy: the phone'"'"'s screen'
+  'android-tools: the phone'"'"'s screen (adb)'
+  'wl-clipboard: received text to the clipboard'
+  'libnotify: the accept prompt (notify-send)'
+  'ttf-nerd-fonts-symbols: icons in the menu'
+)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('57b75c912ef8b814e38d8371391f16afca9c4598dc5fc49fd789f29af32bae5a')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/picha "$pkgdir/usr/bin/picha"
+  sed 's#%h/.local/bin/picha#/usr/bin/picha#' dist/picha-recibe.service | install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/picha-recibe.service"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
