@@ -139,7 +139,9 @@ async fn receive_forever(config: &Config, dir: PathBuf) -> Result<()> {
     let port = listener.local_addr()?.port();
     let me = Endpoint { name: config.name(), kind: DeviceKind::Laptop };
     let id = wire::stable_endpoint_id(&format!("{}/{}", Config::hostname(), me.name));
-    let _advert = mdns::advertise(&me, &id, &Config::hostname(), port)?;
+    let advertise = || mdns::advertise(&me, &id, &Config::hostname(), port);
+    let mut advert = if picha::state::hidden() { None } else { Some(advertise()?) };
+    let mut check = tokio::time::interval(Duration::from_secs(2));
     let _mark = picha::state::ReceiverMark::new();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     println!(
@@ -170,6 +172,12 @@ async fn receive_forever(config: &Config, dir: PathBuf) -> Result<()> {
                 tokio::spawn(one_transfer(stream, dir.clone(), lang));
             }
             // Returning drops the advert, which tells phones picha is gone.
+            // the menu's hide switch
+            _ = check.tick() => match (picha::state::hidden(), advert.is_some()) {
+                (true, true) => advert = None,
+                (false, false) => advert = advertise().ok(),
+                _ => {}
+            },
             _ = tokio::signal::ctrl_c() => return Ok(()),
             _ = terminate.recv() => return Ok(()),
         }
@@ -203,7 +211,9 @@ async fn serve_events(mut events: mpsc::Receiver<Event>, lang: Lang) -> bool {
                 offered = true;
                 shown = 0;
                 from = offer.from.name.clone();
-                let accepted = if Config::load().is_trusted(&offer.trust_key()) {
+                let accepted = if picha::state::hidden() {
+                    false
+                } else if Config::load().is_trusted(&offer.trust_key()) {
                     println!("picha: {} · {}", offer.from.name, lang.t("de confianza, aceptado solo", "trusted, accepted automatically"));
                     true
                 } else {

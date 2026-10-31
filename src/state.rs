@@ -74,3 +74,21 @@ pub fn recent(n: usize) -> Vec<Received> {
     let text = fs::read_to_string(log()).unwrap_or_default();
     text.lines().rev().filter_map(|l| serde_json::from_str(l).ok()).take(n).collect()
 }
+
+fn hidden_file() -> PathBuf {
+    dir().join("oculto")
+}
+
+/// Hidden: the receiver stops announcing itself and turns down Bluetooth files.
+pub fn hidden() -> bool {
+    hidden_file().exists()
+}
+
+pub fn set_hidden(on: bool) {
+    let _ = fs::create_dir_all(dir());
+    if on {
+        let _ = fs::write(hidden_file(), "");
+    } else {
+        let _ = fs::remove_file(hidden_file());
+    }
+}

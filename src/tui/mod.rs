@@ -381,7 +381,8 @@ impl App {
         match self.page {
             Page::Menu => MENU.len(),
             Page::Pick => self.entries.len(),
-            Page::Receive => self.recent.len() + self.trusted.len(),
+            // the hide switch, what arrived, the trusted phones
+            Page::Receive => 1 + self.recent.len() + self.trusted.len(),
             Page::Screen => self.screen_items().len(),
             Page::Lumbre => 2,
             _ => 0,
@@ -393,8 +394,9 @@ impl App {
         match self.page {
             Page::Menu => self.go(MENU[i]),
             Page::Pick => self.pick_open(),
+            Page::Receive if i == 0 => state::set_hidden(!state::hidden()),
             Page::Receive => {
-                if let Some(r) = self.recent.get(i) {
+                if let Some(r) = self.recent.get(i - 1) {
                     let _ = std::process::Command::new("xdg-open")
                         .arg(&r.path)
                         .stdout(std::process::Stdio::null())
@@ -452,7 +454,7 @@ impl App {
             }
             (Page::Sending, KeyCode::Enter) if self.sending.as_ref().is_none_or(|s| s.result.is_some()) => self.back(),
             (Page::Receive, KeyCode::Char('d')) => {
-                if let Some(phone) = self.sel.checked_sub(self.recent.len()).and_then(|i| self.trusted.get(i)).cloned() {
+                if let Some(phone) = self.sel.checked_sub(1 + self.recent.len()).and_then(|i| self.trusted.get(i)).cloned() {
                     let mut config = Config::load();
                     config.trusted.retain(|t| *t != phone);
                     let _ = config.save();
@@ -718,7 +720,11 @@ fn draw_menu(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
     let top = lines.len() as u16;
     f.render_widget(Paragraph::new(lines), area);
     let th = &app.theme;
-    let receiving = if state::receiver_running() { lang.t("visible", "visible") } else { lang.t("apagado", "off") };
+    let receiving = match (state::receiver_running(), state::hidden()) {
+        (false, _) => lang.t("apagado", "off"),
+        (true, true) => lang.t("oculto", "hidden"),
+        (true, false) => lang.t("visible", "visible"),
+    };
     let items = vec![
         format!("{}{}", icon(th, "󰒋"), lang.t("mandar al cel", "send to the phone")),
         format!("{}{}  · {receiving}", icon(th, "󰇚"), lang.t("recibir", "receive")),
@@ -833,57 +839,70 @@ fn draw_sending(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
 
 fn draw_receive(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
     let (th, lang) = (&app.theme, app.lang);
-    let mut lines = vec![if state::receiver_running() {
+    let running = state::receiver_running();
+    let hidden = state::hidden();
+    let mut lines = vec![if !running {
+        Line::styled(th.case(lang.t("no está recibiendo (arranca con Hyprland)", "not receiving (starts with Hyprland)")), th.warn)
+    } else if hidden {
+        Line::styled(th.case(lang.t("oculto: nadie te ve ni te puede mandar", "hidden: nobody sees you or can send")), th.warn)
+    } else {
         Line::from(vec![
             Span::styled(format!("{}{}", icon(th, "󰇚"), th.case(lang.t("visible como", "visible as"))), th.fg),
             Span::styled(format!(" {}", Config::load().name()), th.current),
+            Span::styled(th.case(lang.t("  · Wi-Fi y Bluetooth", "  · Wi-Fi and Bluetooth")), th.dim),
         ])
-    } else {
-        Line::styled(th.case(lang.t("no está recibiendo (arranca con Hyprland)", "not receiving (starts with Hyprland)")), th.warn)
     }];
-    lines.push(Line::styled(th.case(lang.t("por Wi-Fi (Quick Share) y Bluetooth", "over Wi-Fi (Quick Share) and Bluetooth")), th.dim));
     lines.push(Line::default());
-    lines.push(Line::styled(th.case(lang.t("llegó", "arrived")), th.acc));
     let top = lines.len() as u16;
     f.render_widget(Paragraph::new(lines), area);
 
+    // row 0: the switch; then what arrived; then the trusted phones
+    let switch = if hidden { lang.t("mostrarme", "show me") } else { lang.t("ocultarme", "hide me") };
+    let switch = format!("{}{switch}", icon(th, if hidden { "󰈈" } else { "󰈉" }));
     let mut y = area.y + top;
-    if app.recent.is_empty() {
+    let rect = Rect::new(area.x, y, area.width, 1);
+    f.render_widget(Paragraph::new(Line::from(app.theme.choice(&switch, app.sel == 0, true))), rect);
+    app.rows.push((rect, 0));
+    y += 2;
+
+    let th = &app.theme;
+    f.render_widget(Paragraph::new(Span::styled(th.case(lang.t("llegó", "arrived")), th.acc)), Rect::new(area.x, y, area.width, 1));
+    y += 1;
+    if app.recent.is_empty() && y < area.bottom() {
         f.render_widget(Paragraph::new(Span::styled(th.case(lang.t("  nada todavía", "  nothing yet")), th.dim)), Rect::new(area.x, y, area.width, 1));
         y += 1;
     }
-    let items: Vec<String> = app
+    let mut rows: Vec<(usize, String)> = app
         .recent
         .iter()
-        .map(|r| {
+        .enumerate()
+        .map(|(k, r)| {
             let name = r.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            format!("{name}  · {} · {}", r.from, when(r.at, lang))
+            (1 + k, format!("{name}  · {} · {}", r.from, when(r.at, lang)))
         })
         .collect();
-    let trusted = app.trusted.clone();
-    let recent_len = items.len();
-    let rows_area = Rect { y, height: area.bottom().saturating_sub(y), ..area };
-    menu_rows(f, app, rows_area, items);
-    let th = &app.theme;
-    let ty = rows_area.y + recent_len as u16 + 1;
-    if ty < area.bottom() {
-        f.render_widget(
-            Paragraph::new(Span::styled(th.case(lang.t("de confianza (sin preguntar)", "trusted (no prompt)")), th.acc)),
-            Rect::new(area.x, ty, area.width, 1),
-        );
-    }
-    for (k, phone) in trusted.iter().enumerate() {
-        let yy = ty + 1 + k as u16;
-        if yy >= area.bottom() {
+    let first_trusted = 1 + app.recent.len();
+    rows.extend(app.trusted.iter().enumerate().map(|(k, t)| (first_trusted + k, t.clone())));
+    for (i, text) in rows {
+        if i == first_trusted {
+            y += 1;
+            if y < area.bottom() {
+                f.render_widget(
+                    Paragraph::new(Span::styled(app.theme.case(lang.t("de confianza (sin preguntar)", "trusted (no prompt)")), app.theme.acc)),
+                    Rect::new(area.x, y, area.width, 1),
+                );
+            }
+            y += 1;
+        }
+        if y >= area.bottom() {
             break;
         }
-        let i = recent_len + k;
-        let rect = Rect::new(area.x, yy, area.width, 1);
-        let spans = app.theme.choice(phone, i == app.sel, true);
-        f.render_widget(Paragraph::new(Line::from(spans)), rect);
+        let rect = Rect::new(area.x, y, area.width, 1);
+        f.render_widget(Paragraph::new(Line::from(app.theme.choice(&text, i == app.sel, true))), rect);
         app.rows.push((rect, i));
+        y += 1;
     }
-    lang.t("enter abrir · o carpeta · d olvidar · esc menú", "enter open · o folder · d forget · esc menu")
+    lang.t("enter elegir · o carpeta · d olvidar · esc menú", "enter choose · o folder · d forget · esc menu")
 }
 
 fn draw_screen(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {

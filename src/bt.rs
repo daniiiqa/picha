@@ -44,6 +44,9 @@ impl Agent {
 impl Agent {
     /// Returns where obexd should store the file, or an error to reject it.
     async fn authorize_push(&self, transfer: OwnedObjectPath) -> fdo::Result<String> {
+        if crate::state::hidden() {
+            return Err(fdo::Error::AccessDenied("hidden".into()));
+        }
         let path = transfer.as_str();
         let name: String = property(&self.session, OBEX, path, "org.bluez.obex.Transfer1", "Name").await.unwrap_or_default();
         let size: u64 = property(&self.session, OBEX, path, "org.bluez.obex.Transfer1", "Size").await.unwrap_or(0);
