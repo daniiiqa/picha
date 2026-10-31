@@ -106,10 +106,22 @@ impl Conn {
     }
 
     async fn send_share(&mut self, frame: Vec<u8>) -> Result<()> {
+        if let Ok(f) = proto_share::Frame::decode(&*frame) {
+            debug(format_args!("→ share {:?}", f.v1.and_then(|v| v.r#type).map(share_v1::FrameType::try_from)));
+        }
         for chunk in wire::bytes_payload(frame) {
             self.send(&chunk).await?;
         }
         Ok(())
+    }
+}
+
+/// `PICHA_DEBUG=1`: every frame in and out, timestamped, on stderr.
+fn debug(what: std::fmt::Arguments) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("PICHA_DEBUG").is_some()) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        eprintln!("[{}.{:03}] {what}", now.as_secs() % 86_400, now.subsec_millis());
     }
 }
 
@@ -204,6 +216,16 @@ async fn run(
             }
             raw = next(frames) => {
                 let frame = OfflineFrame::decode(&*conn.channel.open(&raw?)?)?;
+                if let Some(t) = frame.v1.as_ref().and_then(|v| v.payload_transfer.as_ref()) {
+                    let (h, c) = (t.payload_header.clone().unwrap_or_default(), t.payload_chunk.clone().unwrap_or_default());
+                    debug(format_args!(
+                        "← payload packet={:?} type={:?} id={:?} total={:?} offset={:?} flags={:?} len={} control={:?}",
+                        t.packet_type, h.r#type, h.id, h.total_size, c.offset, c.flags,
+                        c.body.as_ref().map_or(0, Vec::len), t.control_message
+                    ));
+                } else {
+                    debug(format_args!("← {:?}", frame_type(&frame)));
+                }
                 match frame_type(&frame) {
                     Some(v1_frame::FrameType::KeepAlive) => {
                         let ack = frame.v1.as_ref().and_then(|v| v.keep_alive.as_ref()).and_then(|k| k.ack);
@@ -252,6 +274,7 @@ async fn run(
                                 }
                             let inner = proto_share::Frame::decode(&*payload)?;
                             let v1 = inner.v1.unwrap_or_default();
+                            debug(format_args!("← share {:?}", v1));
                             match v1.r#type.and_then(|t| share_v1::FrameType::try_from(t).ok()) {
                                 Some(share_v1::FrameType::PairedKeyEncryption) => {
                                     conn.send_share(share::paired_key_result()).await?;

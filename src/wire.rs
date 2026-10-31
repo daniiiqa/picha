@@ -96,6 +96,14 @@ pub fn endpoint_id() -> String {
     random_bytes::<4>().iter().map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect()
 }
 
+/// An endpoint id that stays the same across restarts, so a phone's cached
+/// listing of this machine stays valid.
+pub fn stable_endpoint_id(seed: &str) -> String {
+    use sha2::{Digest, Sha256};
+    const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    Sha256::digest(seed.as_bytes())[..4].iter().map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect()
+}
+
 /// The mDNS instance name: PCP byte, endpoint id, Quick Share's service id hash, two zeros.
 pub fn mdns_name(endpoint_id: &str) -> String {
     let mut b = vec![0x23];

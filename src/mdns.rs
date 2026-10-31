@@ -13,7 +13,7 @@ pub struct Advert {
     fullname: String,
 }
 
-pub fn advertise(me: &Endpoint, host: &str, port: u16) -> Result<Advert> {
+pub fn advertise(me: &Endpoint, endpoint_id: &str, host: &str, port: u16) -> Result<Advert> {
     let daemon = ServiceDaemon::new().map_err(|e| protocol(format!("mDNS: {e}")))?;
     // A phone given 127.0.0.1 would dial itself.
     daemon
@@ -22,7 +22,7 @@ pub fn advertise(me: &Endpoint, host: &str, port: u16) -> Result<Advert> {
     let txt = wire::mdns_txt(me);
     let info = ServiceInfo::new(
         SERVICE,
-        &wire::mdns_name(&wire::endpoint_id()),
+        &wire::mdns_name(endpoint_id),
         &format!("{host}.local."),
         "",
         port,

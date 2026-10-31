@@ -2,9 +2,9 @@
 
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// The name phones see; empty uses the hostname.
@@ -13,7 +13,14 @@ pub struct Config {
     pub dir: String,
     /// "es" or "en"; empty follows $LANG.
     pub lang: String,
+    /// TCP port phones connect to; 0 uses picha's fixed default.
+    pub port: u16,
+    /// Phones whose transfers are accepted without asking, by the name they announce.
+    pub trusted: Vec<String>,
 }
+
+/// Fixed so restarts keep the address phones have cached.
+pub const DEFAULT_PORT: u16 = 47_374;
 
 fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
@@ -24,11 +31,25 @@ pub fn config_dir() -> PathBuf {
 }
 
 impl Config {
+    fn path() -> PathBuf {
+        config_dir().join("picha/config.json")
+    }
+
     pub fn load() -> Self {
-        std::fs::read_to_string(config_dir().join("picha/config.json"))
+        std::fs::read_to_string(Self::path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        let path = Self::path();
+        std::fs::create_dir_all(path.parent().expect("config path has a parent"))?;
+        std::fs::write(path, serde_json::to_string_pretty(self).expect("config serializes") + "\n")
+    }
+
+    pub fn is_trusted(&self, phone: &str) -> bool {
+        self.trusted.iter().any(|t| t == phone)
     }
 
     pub fn hostname() -> String {
@@ -52,6 +73,10 @@ impl Config {
                     .map(|v| PathBuf::from(v.trim_matches('"').replace("$HOME", &home().to_string_lossy())))
             })
             .unwrap_or_else(|| home().join("Downloads"))
+    }
+
+    pub fn port(&self) -> u16 {
+        if self.port == 0 { DEFAULT_PORT } else { self.port }
     }
 
     pub fn spanish(&self) -> bool {
