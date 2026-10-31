@@ -20,10 +20,30 @@ use crate::wire::{self, share, Assembler, Endpoint};
 #[derive(Debug, Clone)]
 pub struct Offer {
     pub from: Endpoint,
-    /// The 4 digits the phone shows too.
-    pub pin: String,
+    /// The 4 digits the phone shows too (Quick Share only).
+    pub pin: Option<String>,
     pub files: Vec<OfferedFile>,
     pub text: Option<TextKind>,
+    pub via: Via,
+}
+
+/// How an offer arrived, which decides how its phone is recognized next time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Via {
+    /// Quick Share on the local network: phones are known by the name they announce.
+    Wifi,
+    /// Bluetooth file transfer from a paired phone, known by its address.
+    Bluetooth(String),
+}
+
+impl Offer {
+    /// The key "Always from this phone" stores.
+    pub fn trust_key(&self) -> String {
+        match &self.via {
+            Via::Wifi => self.from.name.clone(),
+            Via::Bluetooth(address) => format!("bluetooth {address}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,7 +92,7 @@ impl Drop for Partial {
 }
 
 /// A file name from the phone, made safe to join onto the download folder.
-fn safe_name(name: &str) -> String {
+pub(crate) fn safe_name(name: &str) -> String {
     let base = Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or("");
     let clean: String = base.chars().filter(|c| !c.is_control()).collect();
     match clean.trim() {
@@ -82,7 +102,7 @@ fn safe_name(name: &str) -> String {
 }
 
 /// `dir/name`, or `dir/name (1).ext`… if that exists.
-fn unique_path(dir: &Path, name: &str) -> PathBuf {
+pub(crate) fn unique_path(dir: &Path, name: &str) -> PathBuf {
     let first = dir.join(name);
     if !first.exists() {
         return first;
@@ -306,9 +326,10 @@ async fn run(
                                     }
                                     let offer = Offer {
                                         from: from.clone(),
-                                        pin: pin.clone(),
+                                        pin: Some(pin.clone()),
                                         files: files.iter().map(|(_, f)| f.clone()).collect(),
                                         text: offered_text.map(|(_, k)| k),
+                                        via: Via::Wifi,
                                     };
                                     let (tx, rx) = oneshot::channel();
                                     events.send(Event::Offer(offer, tx)).await.map_err(|_| protocol("nobody to ask"))?;

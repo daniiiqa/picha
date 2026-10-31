@@ -31,7 +31,7 @@ async fn receiver(dir: PathBuf, accept: bool) -> (std::net::SocketAddr, tokio::t
                 Event::Offer(offer, answer) => {
                     assert_eq!(offer.from.name, "S21 de prueba");
                     assert_eq!(offer.from.kind, DeviceKind::Phone);
-                    pin = Some(offer.pin);
+                    pin = offer.pin;
                     answer.send(accept).unwrap();
                 }
                 Event::Files(paths) => files = paths,

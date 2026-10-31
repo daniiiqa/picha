@@ -1,3 +1,4 @@
+pub mod bt;
 pub mod config;
 pub mod crypto;
 pub mod error;

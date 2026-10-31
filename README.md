@@ -19,8 +19,11 @@ open or copy, text goes to the clipboard.
 
 ## Status
 
-- ✅ Receiving files, links and text over Wi-Fi (phone and laptop on the same network)
-- 🧪 Tested end to end between picha's own sender and receiver; first phone tests in progress
+- ✅ Receiving files, links and text over Wi-Fi (phone and laptop on the same network),
+  tested with a Galaxy S21 on One UI 7
+- ✅ Receiving over Bluetooth with no network at all: Share → Bluetooth from a paired
+  phone (needs `bluez-obex`; slower, fine for photos and documents)
+- ✅ "Always from this phone": trusted phones skip the prompt (`picha confianza`, `picha olvida`)
 - ⏳ Sending to the phone (the protocol side exists; Android only listens after a
   Bluetooth LE nudge, which is next)
 

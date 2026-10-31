@@ -102,6 +102,19 @@ async fn receive_forever(config: &Config, dir: PathBuf) -> Result<()> {
         lang.t("guardando en", "saving to"),
         dir.display()
     );
+    // Bluetooth is a bonus: without obexd picha still receives over Wi-Fi.
+    let (bt_events, bt_rx) = mpsc::channel(64);
+    let _bluetooth = match picha::bt::receive(dir.clone(), bt_events).await {
+        Ok(receiver) => {
+            println!("picha: {}", lang.t("también por Bluetooth (celulares emparejados)", "also over Bluetooth (paired phones)"));
+            tokio::spawn(serve_events(bt_rx, lang));
+            Some(receiver)
+        }
+        Err(e) => {
+            eprintln!("picha: {e} · {}", lang.t("sin Bluetooth (¿falta bluez-obex?)", "no Bluetooth (is bluez-obex installed?)"));
+            None
+        }
+    };
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -117,21 +130,37 @@ async fn receive_forever(config: &Config, dir: PathBuf) -> Result<()> {
 }
 
 async fn one_transfer(stream: TcpStream, dir: PathBuf, lang: Lang) {
-    let (tx, mut events) = mpsc::channel(64);
+    let (tx, events) = mpsc::channel(64);
     let task = tokio::spawn(async move { receive::handle(stream, &dir, tx).await.map(|()| dir) });
+    let offered = serve_events(events, lang).await;
+    match task.await {
+        Ok(Ok(_)) | Ok(Err(Error::Rejected)) => {}
+        Ok(Err(e)) if !offered => eprintln!("picha: {e} {}", lang.t("(antes de ofrecer nada)", "(before offering anything)")),
+        Ok(Err(e)) => {
+            eprintln!("picha: {e}");
+            notify(lang.t("No se pudo recibir", "Couldn't receive"), &e.to_string(), &[]).await;
+        }
+        Err(e) => eprintln!("picha: {e}"),
+    }
+}
+
+/// Answers offers and reports progress for one source of events; returns whether
+/// anything was offered.
+async fn serve_events(mut events: mpsc::Receiver<Event>, lang: Lang) -> bool {
     let mut shown = 0;
     let mut offered = false;
     while let Some(event) = events.recv().await {
         match event {
             Event::Offer(offer, answer) => {
                 offered = true;
-                let accepted = if Config::load().is_trusted(&offer.from.name) {
+                shown = 0;
+                let accepted = if Config::load().is_trusted(&offer.trust_key()) {
                     println!("picha: {} · {}", offer.from.name, lang.t("de confianza, aceptado solo", "trusted, accepted automatically"));
                     true
                 } else {
                     match ask(&offer, lang).await {
                         Answer::Always => {
-                            trust(&offer.from.name, lang);
+                            trust(&offer.trust_key(), lang);
                             true
                         }
                         Answer::Accept => true,
@@ -157,15 +186,7 @@ async fn one_transfer(stream: TcpStream, dir: PathBuf, lang: Lang) {
             }
         }
     }
-    match task.await {
-        Ok(Ok(_)) | Ok(Err(Error::Rejected)) => {}
-        Ok(Err(e)) if !offered => eprintln!("picha: {e} {}", lang.t("(antes de ofrecer nada)", "(before offering anything)")),
-        Ok(Err(e)) => {
-            eprintln!("picha: {e}");
-            notify(lang.t("No se pudo recibir", "Couldn't receive"), &e.to_string(), &[]).await;
-        }
-        Err(e) => eprintln!("picha: {e}"),
-    }
+    offered
 }
 
 fn size(bytes: u64) -> String {
@@ -220,8 +241,15 @@ async fn ask(offer: &Offer, lang: Lang) -> Answer {
     };
     let total: u64 = offer.files.iter().map(|f| f.size).sum();
     let title = format!("{} {} {what}", offer.from.name, lang.t("te picha", "wants to send"));
-    let mut body = if offer.files.is_empty() { String::new() } else { format!("{} · ", size(total)) };
-    body += &format!("PIN {}", offer.pin);
+    let mut parts = Vec::new();
+    if !offer.files.is_empty() {
+        parts.push(size(total));
+    }
+    match &offer.pin {
+        Some(pin) => parts.push(format!("PIN {pin}")),
+        None => parts.push("Bluetooth".into()),
+    }
+    let body = parts.join(" · ");
     println!("picha: {title} ({body})");
     let actions = [
         ("accept", lang.t("Aceptar", "Accept")),
