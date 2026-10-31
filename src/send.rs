@@ -16,9 +16,18 @@ use crate::wire::{self, share, Assembler, Endpoint};
 
 const CHUNK: usize = 512 * 1024;
 
+/// (file index, bytes of it sent, its size).
+pub type Progress = (usize, u64, u64);
+
 /// Sends `files` to the server at `addr`. `on_pin` gets the PIN as soon as both sides
 /// know it, so it can be shown while the other side decides.
-pub async fn send(addr: SocketAddr, me: &Endpoint, files: &[PathBuf], on_pin: impl FnOnce(&str)) -> Result<()> {
+pub async fn send(
+    addr: SocketAddr,
+    me: &Endpoint,
+    files: &[PathBuf],
+    on_pin: impl FnOnce(&str),
+    progress: Option<tokio::sync::mpsc::Sender<Progress>>,
+) -> Result<()> {
     let mut stream = TcpStream::connect(addr).await?;
     wire::write_frame(&mut stream, &wire::connection_request(&wire::endpoint_id(), me)).await?;
     let (handshake, client_init) = ClientHandshake::new();
@@ -65,8 +74,13 @@ pub async fn send(addr: SocketAddr, me: &Endpoint, files: &[PathBuf], on_pin: im
                         if status != Some(connection_response_frame::Status::Accept as i32) {
                             return Err(Error::Rejected);
                         }
-                        for ((id, _, size, _), path) in offered.iter().zip(files) {
-                            stream_file(&mut stream, &mut channel, *id, *size, path).await?;
+                        for (i, ((id, _, size, _), path)) in offered.iter().zip(files).enumerate() {
+                            stream_file(&mut stream, &mut channel, *id, *size, path, |sent| {
+                                if let Some(p) = &progress {
+                                    let _ = p.try_send((i, sent, *size as u64));
+                                }
+                            })
+                            .await?;
                         }
                         Vec::new()
                     }
@@ -90,6 +104,7 @@ async fn stream_file(
     id: i64,
     size: i64,
     path: &PathBuf,
+    mut sent: impl FnMut(u64),
 ) -> Result<()> {
     let mut file = File::open(path).await?;
     let mut offset = 0i64;
@@ -102,7 +117,43 @@ async fn stream_file(
         let frame = wire::payload_chunk(id, PayloadType::File, size, offset, buf[..n].to_vec(), false);
         wire::write_frame(stream, &channel.seal(&frame)).await?;
         offset += n as i64;
+        sent(offset as u64);
     }
     let last = wire::payload_chunk(id, PayloadType::File, size, offset, Vec::new(), true);
     wire::write_frame(stream, &channel.seal(&last)).await
+}
+
+/// Nudges nearby phones over Bluetooth LE and waits up to `wait` for one to show up
+/// on the network as a Quick Share receiver: its address and how it describes
+/// itself (hidden phones give no name). Not this laptop's own receiver.
+pub async fn find_phone(wait: std::time::Duration) -> Option<(SocketAddr, Option<Endpoint>)> {
+    use base64::Engine;
+    use mdns_sd::{ServiceDaemon, ServiceEvent};
+
+    let nudge = crate::ble::nudge().await.ok();
+    let mdns = ServiceDaemon::new().ok()?;
+    let events = mdns.browse("_FC9F5ED42C8A._tcp.local.").ok()?;
+    let me = crate::config::Config::load();
+    let deadline = std::time::Instant::now() + wait;
+    let mut found = None;
+    while let Ok(event) = tokio::task::block_in_place(|| events.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))) {
+        let ServiceEvent::ServiceResolved(info) = event else { continue };
+        let raw = info
+            .get_property_val_str("n")
+            .and_then(|t| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(t).ok())
+            .unwrap_or_default();
+        let endpoint = Endpoint::decode(&raw).ok();
+        if endpoint.as_ref().is_some_and(|e| e.name == me.name()) && info.get_port() == me.port() {
+            continue;
+        }
+        if let Some(ip) = info.get_addresses_v4().into_iter().next() {
+            found = Some((SocketAddr::new(std::net::IpAddr::V4(ip), info.get_port()), endpoint));
+            break;
+        }
+    }
+    let _ = mdns.shutdown();
+    if let Some(n) = nudge {
+        n.stop().await;
+    }
+    found
 }

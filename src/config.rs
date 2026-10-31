@@ -17,6 +17,8 @@ pub struct Config {
     pub port: u16,
     /// Phones whose transfers are accepted without asking, by the name they announce.
     pub trusted: Vec<String>,
+    /// The lumbre's Wi-Fi password, made the first time it's lit.
+    pub lumbre_password: String,
 }
 
 /// Fixed so restarts keep the address phones have cached.

@@ -21,6 +21,7 @@ use ratatui::Frame;
 
 use picha::bt::{self, Phone};
 use picha::config::Config;
+use picha::lumbre;
 use picha::pantalla::{self, Info, Link};
 use picha::state::{self, Received};
 
@@ -78,12 +79,23 @@ struct Entry {
     dir: bool,
 }
 
+/// How a send is going, from the task doing it.
+enum Update {
+    /// The route: Quick Share over Wi-Fi (true) or Bluetooth (false), and to whom.
+    Via(bool, String),
+    Pin(String),
+    Progress(usize, u64, u64),
+    Done(Result<(), String>),
+}
+
 struct Sending {
     files: Vec<PathBuf>,
-    to: String,
+    started: Instant,
+    /// None while looking for the phone.
+    via: Option<(bool, String)>,
+    pin: Option<String>,
     progress: (usize, u64, u64),
-    rx: tokio::sync::mpsc::Receiver<bt::SendProgress>,
-    done: mpsc::Receiver<picha::error::Result<()>>,
+    rx: mpsc::Receiver<Update>,
     result: Option<Result<(), String>>,
 }
 
@@ -125,6 +137,10 @@ struct App {
     /// Mandar opens taco (discada's explorer) to choose, when it's installed.
     taco: bool,
     want_taco: bool,
+    // the lumbre
+    lumbre_on: bool,
+    lumbre_busy: Option<Instant>,
+    lumbre_rx: Option<mpsc::Receiver<std::result::Result<bool, String>>>,
 }
 
 fn home() -> PathBuf {
@@ -206,6 +222,9 @@ impl App {
             note: None,
             taco: which("taco"),
             want_taco: false,
+            lumbre_on: lumbre::is_on(),
+            lumbre_busy: None,
+            lumbre_rx: None,
         };
         app.load_phones();
         match start {
@@ -248,8 +267,25 @@ impl App {
             }
             Page::Pick => self.entries = list_dir(&self.dir),
             Page::Screen => self.search_screen(),
+            Page::Lumbre => self.lumbre_on = lumbre::is_on(),
             _ => {}
         }
+    }
+
+    /// Lights or puts out the lumbre; NetworkManager takes a few seconds.
+    fn toggle_lumbre(&mut self) {
+        if self.lumbre_busy.is_some() {
+            return;
+        }
+        let light = !self.lumbre_on;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let r = if light { lumbre::start().map(|_| true) } else { lumbre::stop().map(|()| false) };
+            let _ = tx.send(r.map_err(|e| e.to_string()));
+        });
+        self.lumbre_busy = Some(Instant::now());
+        self.lumbre_rx = Some(rx);
+        self.note = None;
     }
 
     /// Esc/back: to the menu, or out when `picha` opened on this page.
@@ -303,26 +339,18 @@ impl App {
         }
     }
 
+    /// Sends by the fastest route: Quick Share when the phone answers the nudge on
+    /// the network (the lumbre's too), else Bluetooth to the paired phone.
     fn send(&mut self, files: Vec<PathBuf>) {
         self.page = Page::Sending;
-        let Some(phone) = self.phones.first().cloned().or_else(|| {
-            // the menu may not have its phones yet
-            futures_block(bt::phones()).into_iter().next()
-        }) else {
-            self.sending = None;
-            self.note = Some((
-                self.lang.t("no hay cel emparejado por Bluetooth", "no phone paired over Bluetooth").into(),
-                true,
-            ));
-            return;
-        };
-        let (ptx, prx) = tokio::sync::mpsc::channel(64);
-        let (dtx, drx) = mpsc::channel();
-        let (address, list) = (phone.address.clone(), files.clone());
+        let (tx, rx) = mpsc::channel();
+        let list = files.clone();
+        let paired = self.phones.first().cloned();
         tokio::spawn(async move {
-            let _ = dtx.send(bt::send(&address, &list, ptx).await);
+            let done = route_and_send(list, paired, tx.clone()).await;
+            let _ = tx.send(Update::Done(done));
         });
-        self.sending = Some(Sending { files, to: phone.name, progress: (0, 0, 0), rx: prx, done: drx, result: None });
+        self.sending = Some(Sending { files, started: Instant::now(), via: None, pin: None, progress: (0, 0, 0), rx, result: None });
     }
 
     fn pick_open(&mut self) {
@@ -355,6 +383,7 @@ impl App {
             Page::Pick => self.entries.len(),
             Page::Receive => self.recent.len() + self.trusted.len(),
             Page::Screen => self.screen_items().len(),
+            Page::Lumbre => 2,
             _ => 0,
         }
     }
@@ -378,6 +407,8 @@ impl App {
                     self.screen_choose(item);
                 }
             }
+            Page::Lumbre if i == 0 => self.toggle_lumbre(),
+            Page::Lumbre => self.back(),
             _ => {}
         }
     }
@@ -471,12 +502,22 @@ impl App {
             self.stage = ScreenStage::Searching(Instant::now());
             self.back();
         }
-        if let Some(s) = self.sending.as_mut() {
-            while let Ok(p) = s.rx.try_recv() {
-                s.progress = p;
+        if let Some(r) = self.lumbre_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.lumbre_rx = None;
+            self.lumbre_busy = None;
+            match r {
+                Ok(on) => self.lumbre_on = on,
+                Err(e) => self.note = Some((e, true)),
             }
-            if let Ok(r) = s.done.try_recv() {
-                s.result = Some(r.map_err(|e| e.to_string()));
+        }
+        if let Some(s) = self.sending.as_mut() {
+            while let Ok(u) = s.rx.try_recv() {
+                match u {
+                    Update::Via(wifi, to) => s.via = Some((wifi, to)),
+                    Update::Pin(pin) => s.pin = Some(pin),
+                    Update::Progress(i, sent, total) => s.progress = (i, sent, total),
+                    Update::Done(r) => s.result = Some(r),
+                }
             }
         }
         let stamp = theme::stamp();
@@ -515,9 +556,38 @@ fn choose_with_taco() -> Vec<PathBuf> {
     std::fs::read_to_string(&out).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect()
 }
 
-/// Runs a future to completion from sync code inside the runtime.
-fn futures_block<F: std::future::Future>(f: F) -> F::Output {
-    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+/// Quick Share if the phone shows up on the network after the nudge, else Bluetooth.
+async fn route_and_send(files: Vec<PathBuf>, paired: Option<Phone>, tx: mpsc::Sender<Update>) -> Result<(), String> {
+    use picha::wire::{DeviceKind, Endpoint};
+    if let Some((addr, endpoint)) = picha::send::find_phone(Duration::from_secs(6)).await {
+        let to = endpoint.map(|e| e.name).or_else(|| paired.as_ref().map(|p| p.name.clone())).unwrap_or_else(|| "cel".into());
+        let _ = tx.send(Update::Via(true, to));
+        let me = Endpoint { name: Config::load().name(), kind: DeviceKind::Laptop };
+        let (ptx, mut prx) = tokio::sync::mpsc::channel::<picha::send::Progress>(64);
+        let fwd = tx.clone();
+        tokio::spawn(async move {
+            while let Some((i, sent, total)) = prx.recv().await {
+                let _ = fwd.send(Update::Progress(i, sent, total));
+            }
+        });
+        let pin_tx = tx.clone();
+        return picha::send::send(addr, &me, &files, move |pin| drop(pin_tx.send(Update::Pin(pin.to_string()))), Some(ptx))
+            .await
+            .map_err(|e| e.to_string());
+    }
+    let phone = match paired {
+        Some(p) => p,
+        None => bt::phones().await.into_iter().next().ok_or("no phone found, on the network or paired over Bluetooth")?,
+    };
+    let _ = tx.send(Update::Via(false, phone.name.clone()));
+    let (ptx, mut prx) = tokio::sync::mpsc::channel::<bt::SendProgress>(64);
+    let fwd = tx.clone();
+    tokio::spawn(async move {
+        while let Some((i, sent, total)) = prx.recv().await {
+            let _ = fwd.send(Update::Progress(i, sent, total));
+        }
+    });
+    bt::send(&phone.address, &files, ptx).await.map_err(|e| e.to_string())
 }
 
 pub async fn run(lang: Lang, start: Start) -> io::Result<()> {
@@ -653,7 +723,11 @@ fn draw_menu(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
         format!("{}{}", icon(th, "󰒋"), lang.t("mandar al cel", "send to the phone")),
         format!("{}{}  · {receiving}", icon(th, "󰇚"), lang.t("recibir", "receive")),
         format!("{}{}", icon(th, "󰹑"), lang.t("pantalla del cel", "phone screen")),
-        format!("{}lumbre  · {}", icon(th, "󱠡"), lang.t("sin red (pronto)", "no network (soon)")),
+        format!(
+            "{}lumbre  · {}",
+            icon(th, "󱠡"),
+            if app.lumbre_on { lang.t("prendida", "lit") } else { lang.t("sin red", "no network") }
+        ),
     ];
     let menu = Rect { y: area.y + top, height: area.height.saturating_sub(top), ..area };
     menu_rows(f, app, menu, items);
@@ -708,14 +782,27 @@ fn draw_sending(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
         return lang.t("enter volver", "enter back");
     };
     let (i, sent, total) = s.progress;
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(th.case(&format!("{} ", lang.t("a", "to"))), th.dim),
-            Span::styled(s.to.clone(), th.current),
-            Span::styled(th.case(&format!("  · {}", lang.t("por Bluetooth", "over Bluetooth"))), th.dim),
+    let mut lines = vec![match &s.via {
+        None => Line::from(vec![
+            Span::styled(format!("{} ", spinner(th, s.started)), th.acc),
+            Span::styled(th.case(lang.t("buscando el cel…", "looking for the phone…")), th.fg),
         ]),
-        Line::default(),
-    ];
+        Some((wifi, to)) => Line::from(vec![
+            Span::styled(th.case(&format!("{} ", lang.t("a", "to"))), th.dim),
+            Span::styled(to.clone(), th.current),
+            Span::styled(
+                th.case(&format!(
+                    "  · {}",
+                    if *wifi { lang.t("Quick Share, rápido", "Quick Share, fast") } else { lang.t("por Bluetooth", "over Bluetooth") }
+                )),
+                th.dim,
+            ),
+        ]),
+    }];
+    if let Some(pin) = &s.pin {
+        lines.push(Line::styled(th.case(&format!("PIN {pin} · {}", lang.t("el mismo que en el cel", "same as on the phone"))), th.acc2));
+    }
+    lines.push(Line::default());
     for (n, file) in s.files.iter().enumerate() {
         let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let state = match (&s.result, n.cmp(&i)) {
@@ -908,15 +995,83 @@ fn draw_screen(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
 }
 
 fn draw_lumbre(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
+    use ratatui::style::{Color, Style};
     let (th, lang) = (&app.theme, app.lang);
-    let lines = vec![
-        Line::styled(th.case(lang.t("cuando no hay red", "when there's no network")), th.current),
-        Line::default(),
-        Line::styled(th.case(lang.t("la laptop pone su propio Wi-Fi", "the laptop makes its own Wi-Fi")), th.fg),
-        Line::styled(th.case(lang.t("y mandar y recibir siguen rápidos.", "so sending and receiving stay fast.")), th.fg),
-        Line::default(),
-        Line::styled(th.case(lang.t("pronto: todavía no está lista", "soon: not ready yet")), th.dim),
-    ];
-    f.render_widget(Paragraph::new(lines), area);
-    lang.t("esc menú", "esc menu")
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(since) = app.lumbre_busy {
+        let what = if app.lumbre_on { lang.t("apagando la lumbre…", "putting the lumbre out…") } else { lang.t("prendiendo la lumbre…", "lighting the lumbre…") };
+        lines.push(Line::from(vec![Span::styled(format!("{} ", spinner(th, since)), th.acc), Span::styled(th.case(what), th.fg)]));
+        f.render_widget(Paragraph::new(lines), area);
+        return lang.t("esc menú", "esc menu");
+    }
+    let l = lumbre::Lumbre::get();
+    if app.lumbre_on {
+        lines.push(Line::from(vec![
+            Span::styled(th.case(lang.t("red ", "network ")), th.dim),
+            Span::styled(l.ssid.clone(), th.current),
+            Span::styled(th.case(lang.t("   clave ", "   password ")), th.dim),
+            Span::styled(l.password.clone(), th.fg),
+        ]));
+        lines.push(Line::styled(th.case(lang.t("apunta la cámara del cel al código", "point the phone's camera at the code")), th.dim));
+        let top = lines.len() as u16;
+        f.render_widget(Paragraph::new(lines), area);
+        // black on white whatever the look: what phone cameras read
+        let qr: Vec<Line> = lumbre::qr_lines(&l.qr_text())
+            .into_iter()
+            .map(|r| Line::styled(r, Style::new().fg(Color::Black).bg(Color::White)))
+            .collect();
+        let qh = qr.len() as u16;
+        let qw = qr.first().map_or(0, |r| r.width() as u16);
+        let qr_area = Rect { x: area.x, y: area.y + top + 1, width: qw.min(area.width), height: qh.min(area.height.saturating_sub(top + 1)) };
+        f.render_widget(Paragraph::new(qr), qr_area);
+        let menu = Rect { y: qr_area.bottom() + 1, height: area.bottom().saturating_sub(qr_area.bottom() + 1), ..area };
+        let th = &app.theme;
+        let items = vec![
+            format!("{}{}", icon(th, "󱠡"), lang.t("apagar la lumbre", "put the lumbre out")),
+            format!("{}{}", icon(th, "󰁍"), lang.t("volver", "back")),
+        ];
+        menu_rows(f, app, menu, items);
+    } else {
+        lines.push(Line::styled(th.case(lang.t("cuando no hay red", "when there's no network")), th.current));
+        lines.push(Line::styled(th.case(lang.t("la laptop pone su propio Wi-Fi", "the laptop makes its own Wi-Fi")), th.fg));
+        lines.push(Line::styled(th.case(&format!("{} {}", lang.t("se llama", "called"), l.ssid)), th.dim));
+        if let Some(net) = lumbre::wifi().and_then(|w| w.network) {
+            lines.push(Line::default());
+            lines.push(Line::styled(th.case(&format!("{} {net} {}", lang.t("la laptop deja", "the laptop leaves"), lang.t("mientras", "meanwhile"))), th.warn));
+        }
+        lines.push(Line::default());
+        let top = lines.len() as u16;
+        f.render_widget(Paragraph::new(lines), area);
+        let th = &app.theme;
+        let items = vec![
+            format!("{}{}", icon(th, "󱠡"), lang.t("prender la lumbre", "light the lumbre")),
+            format!("{}{}", icon(th, "󰁍"), lang.t("volver", "back")),
+        ];
+        let menu = Rect { y: area.y + top, height: area.height.saturating_sub(top), ..area };
+        menu_rows(f, app, menu, items);
+    }
+    lang.t("enter elegir · esc menú", "enter choose · esc menu")
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    use super::*;
+
+    /// The lit lumbre page as text: `cargo test lumbre_preview -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn lumbre_preview() {
+        let mut app = App::new(Lang(false), Start::Menu);
+        app.page = Page::Lumbre;
+        app.lumbre_on = true;
+        let mut terminal = Terminal::new(TestBackend::new(68, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            println!("{}", (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>().trim_end());
+        }
+    }
 }
