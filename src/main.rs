@@ -49,6 +49,9 @@ enum Cmd {
         /// Turn the phone's own screen off while it shows here
         #[arg(long)]
         apagada: bool,
+        /// Open it right away instead of asking first
+        #[arg(long)]
+        ya: bool,
     },
     /// List the phones whose transfers are accepted without asking
     Confianza,
@@ -74,7 +77,7 @@ async fn main() -> ExitCode {
     let config = Config::load();
     let result = match cli.cmd.unwrap_or(Cmd::Recibe { dir: None }) {
         Cmd::Recibe { dir } => receive_forever(&config, dir.unwrap_or_else(|| config.dir())).await,
-        Cmd::Pantalla { addr, empareja, audio, apagada } => pantalla(Lang(config.spanish()), addr, empareja, audio, apagada).await,
+        Cmd::Pantalla { addr, empareja, audio, apagada, ya } => pantalla(Lang(config.spanish()), addr, empareja, audio, apagada, ya).await,
         Cmd::Confianza => {
             for phone in &config.trusted {
                 println!("{phone}");
@@ -212,9 +215,9 @@ async fn serve_events(mut events: mpsc::Receiver<Event>, lang: Lang) -> bool {
 
 /// The phone's card in discada's look, then its window (scrcpy, detached so the
 /// terminal can close). Failures get a card too: from the keybind it's all you see.
-async fn pantalla(lang: Lang, addr: Option<String>, empareja: bool, audio: bool, screen_off: bool) -> Result<()> {
+async fn pantalla(lang: Lang, addr: Option<String>, empareja: bool, audio: bool, screen_off: bool, ya: bool) -> Result<()> {
     use picha::look::{Look, Tone};
-    let Err(e) = pantalla_card(lang, addr, empareja, audio, screen_off).await else { return Ok(()) };
+    let Err(e) = pantalla_card(lang, addr, empareja, audio, screen_off, ya).await else { return Ok(()) };
     let look = Look::load();
     let msg = match &e {
         picha::error::Error::Protocol(m) => m.clone(),
@@ -230,7 +233,7 @@ async fn pantalla(lang: Lang, addr: Option<String>, empareja: bool, audio: bool,
     std::process::exit(1);
 }
 
-async fn pantalla_card(lang: Lang, addr: Option<String>, empareja: bool, audio: bool, screen_off: bool) -> Result<()> {
+async fn pantalla_card(lang: Lang, addr: Option<String>, empareja: bool, audio: bool, screen_off: bool, ya: bool) -> Result<()> {
     use picha::look::{Look, Tone};
     use picha::pantalla;
 
@@ -260,7 +263,7 @@ async fn pantalla_card(lang: Lang, addr: Option<String>, empareja: bool, audio: 
         Some(addr) => pantalla::connect(&addr)?,
         None => match pantalla::ready_devices()?.into_iter().next() {
             Some(serial) => {
-                via_cable = !serial.contains(':');
+                via_cable = pantalla::is_usb(&serial);
                 serial
             }
             None => {
@@ -310,7 +313,7 @@ async fn pantalla_card(lang: Lang, addr: Option<String>, empareja: bool, audio: 
         ],
         (true, None) => vec![(Tone::Fg, format!("󰕓  {}", lang.t("cable", "cable")))],
         (false, _) => vec![
-            (Tone::Fg, format!("󰖩  Wi-Fi {serial}")),
+            (Tone::Fg, format!("󰖩  Wi-Fi {}", wifi.as_deref().unwrap_or(&serial))),
             (Tone::Muted, format!("  · {}", lang.t("cifrado", "encrypted"))),
         ],
     });
@@ -321,6 +324,40 @@ async fn pantalla_card(lang: Lang, addr: Option<String>, empareja: bool, audio: 
     rows.push(vec![(Tone::Muted, lang.t("arrastra archivos a la ventana → Download del cel", "drag files onto the window → the phone's Download").to_string())]);
     rows.push(vec![(Tone::Muted, lang.t("el portapapeles va y viene", "the clipboard goes both ways").to_string())]);
     print!("{}", look.card(&format!("picha · {}", lang.t("pantalla", "screen")), &rows));
+
+    // the user opens it: enter, with the sound and the phone's own screen as chosen
+    let (mut audio, mut screen_off) = (audio, screen_off);
+    if !ya && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        loop {
+            let yes_no = |on: bool| if on { lang.t("sí", "on") } else { lang.t("no", "off") };
+            let key = |k: &str, what: String| format!("{} {}", look.paint(Tone::Primary, k), look.paint(Tone::Fg, &what));
+            let sep = look.paint(Tone::Muted, "  ·  ");
+            print!(
+                "\r\x1b[2K {}{sep}{}{sep}{}{sep}{}",
+                key("enter", lang.t("abrir", "open").into()),
+                key("a", format!("{} {}", lang.t("sonido", "sound"), yes_no(audio))),
+                key("o", format!(
+                    "{} {}",
+                    lang.t("pantalla del cel", "phone screen"),
+                    if screen_off { lang.t("apagada", "off") } else { lang.t("prendida", "on") }
+                )),
+                key("q", lang.t("salir", "quit").into()),
+            );
+            std::io::Write::flush(&mut std::io::stdout())?;
+            match read_key() {
+                Some(b'\r' | b'\n') => break,
+                Some(b'a' | b'A') => audio = !audio,
+                Some(b'o' | b'O') => screen_off = !screen_off,
+                // q, Esc, Ctrl+C, or no terminal to read from
+                Some(b'q' | b'Q' | 27 | 3) | None => {
+                    println!();
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        println!();
+    }
 
     let child = std::process::Command::new("setsid")
         .arg("-f")
@@ -338,6 +375,20 @@ async fn pantalla_card(lang: Lang, addr: Option<String>, empareja: bool, audio: 
         }
         Ok(_) | Err(_) => Err(fail("scrcpy (sudo pacman -S scrcpy)")),
     }
+}
+
+/// One key from the terminal without waiting for Enter (raw mode on /dev/tty).
+fn read_key() -> Option<u8> {
+    use std::io::Read;
+    let tty = std::fs::File::open("/dev/tty").ok()?;
+    let stty = |args: &[&str]| -> Option<()> {
+        std::process::Command::new("stty").args(args).stdin(tty.try_clone().ok()?).status().ok().filter(|s| s.success()).map(|_| ())
+    };
+    stty(&["raw", "-echo"])?;
+    let mut b = [0u8; 1];
+    let got = (&tty).read(&mut b).ok().filter(|n| *n == 1).map(|_| b[0]);
+    stty(&["sane"]);
+    got
 }
 
 fn size(bytes: u64) -> String {

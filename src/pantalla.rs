@@ -128,14 +128,40 @@ fn shell(serial: &str, cmd: &str) -> String {
     adb(&["-s", serial, "shell", cmd]).unwrap_or_default()
 }
 
-/// Where Wireless debugging listens right now (`ip:port`), asked of the phone
-/// itself: Samsung doesn't announce it while the screen is off.
+/// Connected by cable (`adb devices -l` names a usb: path), not over Wi-Fi.
+pub fn is_usb(serial: &str) -> bool {
+    adb(&["devices", "-l"])
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.split_whitespace().next() == Some(serial) && l.contains(" usb:"))
+}
+
+/// adb's own mDNS view: (instance, `ip:port`) of each phone announcing Wireless
+/// debugging; instances are `adb-<serial number>-<random>`.
+fn adb_mdns() -> Vec<(String, String)> {
+    adb(&["mdns", "services"])
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let (name, kind, addr) = (it.next()?, it.next()?, it.next()?);
+            kind.starts_with("_adb-tls-connect").then(|| (name.to_string(), addr.to_string()))
+        })
+        .collect()
+}
+
+/// Where the phone's Wireless debugging listens right now (`ip:port`): the serial
+/// itself when connected by address, else adb's mDNS list, matched by the phone's
+/// serial number. (Samsung leaves service.adb.tls.port empty.)
 pub fn wifi_address(serial: &str) -> Option<String> {
-    let out = shell(serial, "getprop service.adb.tls.port; ip -f inet addr show wlan0");
-    let mut lines = out.lines();
-    let port: u16 = lines.next()?.trim().parse().ok().filter(|p| *p > 0)?;
-    let ip = lines.find_map(|l| l.trim().strip_prefix("inet "))?.split('/').next()?.to_string();
-    Some(format!("{ip}:{port}"))
+    if serial.parse::<std::net::SocketAddr>().is_ok() {
+        return Some(serial.to_string());
+    }
+    let number = shell(serial, "getprop ro.serialno").trim().to_string();
+    adb_mdns()
+        .into_iter()
+        .find(|(name, _)| serial.starts_with(name.as_str()) || (!number.is_empty() && name.contains(&number)))
+        .map(|(_, addr)| addr)
 }
 
 /// Over the cable: turns Wireless debugging back on (Samsung switches it off on its
