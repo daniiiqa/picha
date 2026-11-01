@@ -569,7 +569,7 @@ async fn route_and_send(files: Vec<PathBuf>, paired: Option<Phone>, tx: mpsc::Se
 
 async fn route_and_send_inner(files: Vec<PathBuf>, paired: Option<Phone>, tx: mpsc::Sender<Update>) -> Result<(), String> {
     use picha::wire::{DeviceKind, Endpoint};
-    if let Some((addr, endpoint)) = picha::send::find_phone(Duration::from_secs(6)).await {
+    if let Some((stream, _addr, endpoint)) = picha::send::find_phone(Duration::from_secs(10)).await {
         let to = endpoint.map(|e| e.name).or_else(|| paired.as_ref().map(|p| p.name.clone())).unwrap_or_else(|| "cel".into());
         let _ = tx.send(Update::Via(true, to));
         let me = Endpoint { name: Config::load().name(), kind: DeviceKind::Laptop };
@@ -581,7 +581,7 @@ async fn route_and_send_inner(files: Vec<PathBuf>, paired: Option<Phone>, tx: mp
             }
         });
         let pin_tx = tx.clone();
-        return picha::send::send(addr, &me, &files, move |pin| drop(pin_tx.send(Update::Pin(pin.to_string()))), Some(ptx))
+        return picha::send::send(stream, &me, &files, move |pin| drop(pin_tx.send(Update::Pin(pin.to_string()))), Some(ptx))
             .await
             .map_err(|e| e.to_string());
     }

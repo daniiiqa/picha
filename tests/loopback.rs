@@ -56,7 +56,7 @@ async fn sends_files_end_to_end() {
     let phone = Endpoint { name: "S21 de prueba".into(), kind: DeviceKind::Phone };
     let files = [src.join("video.mp4"), src.join("nota.txt"), src.join("vacío")];
     let mut sender_pin = String::new();
-    send::send(addr, &phone, &files, |p| sender_pin = p.to_string(), None).await.unwrap();
+    send::send(tokio::net::TcpStream::connect(addr).await.unwrap(), &phone, &files, |p| sender_pin = p.to_string(), None).await.unwrap();
 
     let (pin, mut saved, result) = receiver.await.unwrap();
     result.unwrap();
@@ -75,7 +75,7 @@ async fn rejecting_leaves_nothing_behind() {
 
     let (addr, receiver) = receiver(out.clone(), false).await;
     let phone = Endpoint { name: "S21 de prueba".into(), kind: DeviceKind::Phone };
-    let sent = send::send(addr, &phone, &[src.join("foto.jpg")], |_| {}, None).await;
+    let sent = send::send(tokio::net::TcpStream::connect(addr).await.unwrap(), &phone, &[src.join("foto.jpg")], |_| {}, None).await;
     assert!(matches!(sent, Err(Error::Rejected)), "{sent:?}");
 
     let (_, saved, result) = receiver.await.unwrap();

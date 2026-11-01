@@ -19,16 +19,15 @@ const CHUNK: usize = 512 * 1024;
 /// (file index, bytes of it sent, its size).
 pub type Progress = (usize, u64, u64);
 
-/// Sends `files` to the server at `addr`. `on_pin` gets the PIN as soon as both sides
+/// Sends `files` over `stream`, connected to a Quick Share server. `on_pin` gets the PIN as soon as both sides
 /// know it, so it can be shown while the other side decides.
 pub async fn send(
-    addr: SocketAddr,
+    mut stream: TcpStream,
     me: &Endpoint,
     files: &[PathBuf],
     on_pin: impl FnOnce(&str),
     progress: Option<tokio::sync::mpsc::Sender<Progress>>,
 ) -> Result<()> {
-    let mut stream = TcpStream::connect(addr).await?;
     wire::write_frame(&mut stream, &wire::connection_request(&wire::endpoint_id(), me)).await?;
     let (handshake, client_init) = ClientHandshake::new();
     wire::write_frame(&mut stream, &client_init).await?;
@@ -134,9 +133,12 @@ pub fn log(what: &str) {
 }
 
 /// Nudges nearby phones over Bluetooth LE and waits up to `wait` for one to show up
-/// on the network as a Quick Share receiver: its address and how it describes
-/// itself (hidden phones give no name). Not this laptop's own receiver.
-pub async fn find_phone(wait: std::time::Duration) -> Option<(SocketAddr, Option<Endpoint>)> {
+/// on the network as a Quick Share receiver: a connection to it, its address and how
+/// it describes itself (hidden phones give no name). Not this laptop's own receiver.
+/// A phone can still answer mDNS with a port it no longer serves (its announcement
+/// from before the nudge), so each candidate is dialed and a refusal means keep
+/// waiting for the live one.
+pub async fn find_phone(wait: std::time::Duration) -> Option<(TcpStream, SocketAddr, Option<Endpoint>)> {
     use base64::Engine;
     use mdns_sd::{ServiceDaemon, ServiceEvent};
 
@@ -172,12 +174,22 @@ pub async fn find_phone(wait: std::time::Duration) -> Option<(SocketAddr, Option
         if endpoint.as_ref().is_some_and(|e| e.name == me.name()) && info.get_port() == me.port() {
             continue;
         }
-        if let Some(ip) = info.get_addresses_v4().into_iter().next() {
-            found = Some((SocketAddr::new(std::net::IpAddr::V4(ip), info.get_port()), endpoint));
+        for ip in info.get_addresses_v4() {
+            let addr = SocketAddr::new(std::net::IpAddr::V4(ip), info.get_port());
+            match tokio::time::timeout(std::time::Duration::from_secs(2), TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => {
+                    found = Some((stream, addr, endpoint.clone()));
+                    break;
+                }
+                Ok(Err(e)) => log(&format!("dial {addr}: {e} (stale announcement? waiting)")),
+                Err(_) => log(&format!("dial {addr}: timed out")),
+            }
+        }
+        if found.is_some() {
             break;
         }
     }
-    log(&format!("find_phone: {:?}", found.as_ref().map(|f| f.0)));
+    log(&format!("find_phone: {:?}", found.as_ref().map(|f| f.1)));
     let _ = mdns.shutdown();
     if let Some(n) = nudge {
         n.stop().await;
