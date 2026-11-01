@@ -130,9 +130,32 @@ pub fn start() -> Result<Lumbre> {
         let _ = std::fs::write(previous_file(), net);
     }
     let l = Lumbre::get();
-    if let Err(e) = nmcli(&[
-        "device", "wifi", "hotspot", "ifname", &card.device, "con-name", CONNECTION, "ssid", &l.ssid, "band", "bg", "password", &l.password,
-    ]) {
+    // What `nmcli device wifi hotspot` makes, plus link-local IPv6: on a network without
+    // internet the S21's Quick Share server refuses IPv4 and only its fe80:: address is
+    // left, which the laptop can't reach if the hotspot has IPv6 off (NM's default).
+    let settings = [
+        "connection.interface-name", card.device.as_str(),
+        "connection.autoconnect", "no",
+        "802-11-wireless.ssid", l.ssid.as_str(),
+        "802-11-wireless.mode", "ap",
+        "802-11-wireless.band", "bg",
+        "802-11-wireless-security.key-mgmt", "wpa-psk",
+        "802-11-wireless-security.proto", "rsn",
+        "802-11-wireless-security.pairwise", "ccmp",
+        "802-11-wireless-security.group", "ccmp",
+        "802-11-wireless-security.psk", l.password.as_str(),
+        "ipv4.method", "shared",
+        "ipv6.method", "link-local",
+    ];
+    let exists = nmcli(&["-t", "-f", "NAME", "connection", "show"]).is_ok_and(|o| o.lines().any(|n| n == CONNECTION));
+    let mut args = if exists {
+        vec!["connection", "modify", CONNECTION]
+    } else {
+        vec!["connection", "add", "type", "wifi", "con-name", CONNECTION]
+    };
+    args.extend(settings);
+    let lit = nmcli(&args).and_then(|_| nmcli(&["connection", "up", CONNECTION, "ifname", &card.device]));
+    if let Err(e) = lit {
         let _ = stop(); // back to the Wi-Fi, or to airplane mode
         return Err(e);
     }
