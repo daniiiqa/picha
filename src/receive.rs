@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::crypto::{SecureChannel, ServerHandshake};
 use crate::error::{protocol, Error, Result};
+use crate::net::{self, Network};
 use crate::proto::connections::{payload_transfer_frame::payload_header::PayloadType, v1_frame, OfflineFrame};
 use crate::proto::share::{self as proto_share, text_metadata, v1_frame as share_v1};
 use crate::wire::{self, share, Assembler, Endpoint};
@@ -30,18 +31,20 @@ pub struct Offer {
 /// How an offer arrived, which decides how its phone is recognized next time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Via {
-    /// Quick Share on the local network: phones are known by the name they announce.
-    Wifi,
+    /// Quick Share on the local network: phones are known by the name they
+    /// announce, which anyone there can announce too; so only on that network
+    /// (None: one picha can't tell apart, where nothing is trusted).
+    Wifi(Option<Network>),
     /// Bluetooth file transfer from a paired phone, known by its address.
     Bluetooth(String),
 }
 
 impl Offer {
-    /// The key "Always from this phone" stores.
-    pub fn trust_key(&self) -> String {
+    /// The key "Always from this phone" stores; None where it can't be trusted.
+    pub fn trust_key(&self) -> Option<String> {
         match &self.via {
-            Via::Wifi => self.from.name.clone(),
-            Via::Bluetooth(address) => format!("bluetooth {address}"),
+            Via::Wifi(network) => network.as_ref().map(|n| format!("{} · {} · {}", self.from.name, n.name, n.uuid)),
+            Via::Bluetooth(address) => Some(format!("bluetooth {address}")),
         }
     }
 }
@@ -153,6 +156,10 @@ fn frame_type(frame: &OfflineFrame) -> Option<v1_frame::FrameType> {
 
 /// Runs one incoming connection to the end: handshake, offer, transfer.
 pub async fn handle(stream: TcpStream, dir: &Path, events: mpsc::Sender<Event>) -> Result<()> {
+    let network = match stream.local_addr() {
+        Ok(local) => tokio::task::spawn_blocking(move || net::of(local)).await.ok().flatten(),
+        Err(_) => None,
+    };
     let (mut rd, wr) = stream.into_split();
     // Frames are read on their own task so waiting for the user never cuts one in half.
     let (tx, mut frames) = mpsc::channel::<Result<Vec<u8>>>(32);
@@ -165,7 +172,7 @@ pub async fn handle(stream: TcpStream, dir: &Path, events: mpsc::Sender<Event>) 
             }
         }
     });
-    let result = run(&mut frames, wr, dir, &events).await;
+    let result = run(&mut frames, wr, dir, &events, network).await;
     reader.abort();
     result
 }
@@ -179,6 +186,7 @@ async fn run(
     mut wr: OwnedWriteHalf,
     dir: &Path,
     events: &mpsc::Sender<Event>,
+    network: Option<Network>,
 ) -> Result<()> {
     // Plaintext: who's calling, then the UKEY2 exchange.
     let request = OfflineFrame::decode(&*next(frames).await?)?;
@@ -331,7 +339,7 @@ async fn run(
                                         pin: Some(pin.clone()),
                                         files: files.iter().map(|(_, f)| f.clone()).collect(),
                                         text: offered_text.map(|(_, k)| k),
-                                        via: Via::Wifi,
+                                        via: Via::Wifi(network.clone()),
                                     };
                                     let (tx, rx) = oneshot::channel();
                                     events.send(Event::Offer(offer, tx)).await.map_err(|_| protocol("nobody to ask"))?;

@@ -101,16 +101,14 @@ async fn main() -> ExitCode {
         Cmd::Recibe { dir } => receive_forever(&config, dir.unwrap_or_else(|| config.dir())).await,
         Cmd::Pantalla { addr, empareja, audio, apagada, ya } => pantalla(Lang(config.spanish()), addr, empareja, audio, apagada, ya).await,
         Cmd::Confianza => {
-            for phone in &config.trusted {
-                println!("{phone}");
+            for key in &config.trusted {
+                println!("{}", Config::label(key));
             }
             Ok(())
         }
         Cmd::Olvida { phone } => {
             let mut config = config;
-            let before = config.trusted.len();
-            config.trusted.retain(|t| *t != phone);
-            if config.trusted.len() == before {
+            if !config.forget(&phone) {
                 eprintln!("picha: \"{phone}\" {}", Lang(config.spanish()).t("no estaba en confianza", "wasn't trusted"));
             }
             config.save().map_err(Error::from)
@@ -215,13 +213,15 @@ async fn serve_events(mut events: mpsc::Receiver<Event>, lang: Lang) -> bool {
                 from = offer.from.name.clone();
                 let accepted = if picha::state::hidden() {
                     false
-                } else if Config::load().is_trusted(&offer.trust_key()) {
+                } else if offer.trust_key().is_some_and(|k| Config::load().is_trusted(&k)) {
                     println!("picha: {} · {}", offer.from.name, lang.t("de confianza, aceptado solo", "trusted, accepted automatically"));
                     true
                 } else {
                     match ask(&offer, lang).await {
                         Answer::Always => {
-                            trust(&offer.trust_key(), lang);
+                            if let Some(key) = offer.trust_key() {
+                                trust(&key, lang);
+                            }
                             true
                         }
                         Answer::Accept => true,
@@ -332,7 +332,7 @@ fn trust(phone: &str, lang: Lang) {
     if !config.is_trusted(phone) {
         config.trusted.push(phone.to_string());
         match config.save() {
-            Ok(()) => println!("picha: \"{phone}\" {}", lang.t("ahora es de confianza", "is now trusted")),
+            Ok(()) => println!("picha: \"{}\" {}", Config::label(phone), lang.t("ahora es de confianza", "is now trusted")),
             Err(e) => eprintln!("picha: {e}"),
         }
     }
@@ -358,11 +358,11 @@ async fn ask(offer: &Offer, lang: Lang) -> Answer {
     let body = parts.join(" · ");
     println!("picha: {title} ({body})");
     // short: arre puts the buttons on one line and drops what doesn't fit
-    let actions = [
-        ("accept", lang.t("Aceptar", "Accept")),
-        ("reject", lang.t("Rechazar", "Reject")),
-        ("always", lang.t("Siempre", "Always")),
-    ];
+    // "Always" only where the phone can be told apart (see net.rs)
+    let mut actions = vec![("accept", lang.t("Aceptar", "Accept")), ("reject", lang.t("Rechazar", "Reject"))];
+    if offer.trust_key().is_some() {
+        actions.push(("always", lang.t("Siempre", "Always")));
+    }
     match notify_for(&title, &body, &actions, ASK_TIMEOUT).await.as_deref() {
         Some("accept") => Answer::Accept,
         Some("always") => Answer::Always,

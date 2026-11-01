@@ -461,7 +461,7 @@ impl App {
             (Page::Receive, KeyCode::Char('d')) => {
                 if let Some(phone) = self.sel.checked_sub(1 + self.recent.len()).and_then(|i| self.trusted.get(i)).cloned() {
                     let mut config = Config::load();
-                    config.trusted.retain(|t| *t != phone);
+                    config.forget(&phone);
                     let _ = config.save();
                     self.trusted = config.trusted;
                     self.sel = self.sel.min(self.rows_len().saturating_sub(1));
@@ -915,7 +915,7 @@ fn draw_receive(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
         })
         .collect();
     let first_trusted = 1 + app.recent.len();
-    rows.extend(app.trusted.iter().enumerate().map(|(k, t)| (first_trusted + k, t.clone())));
+    rows.extend(app.trusted.iter().enumerate().map(|(k, t)| (first_trusted + k, Config::label(t).to_string())));
     for (i, text) in rows {
         if i == first_trusted {
             y += 1;

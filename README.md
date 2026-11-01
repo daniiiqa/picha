@@ -13,7 +13,9 @@ picha pantalla         the phone's screen here
 - **Receive** what the phone shares: on the phone, **Share → Quick Share** (Wi-Fi,
   fast) or **Share → Bluetooth** (no network needed) and pick the laptop. A
   notification asks (Aceptar · Rechazar · Siempre); files go to Downloads, links
-  open or copy, text goes to the clipboard. "Siempre" trusts that phone from then on.
+  open or copy, text goes to the clipboard. "Siempre" trusts that phone from then on:
+  over Bluetooth by its address, over Wi-Fi only on that network (anyone on a
+  network can announce any phone's name, so trust doesn't follow you to the café).
 - **Send** to the phone: picha nudges it over Bluetooth LE, then uses Quick Share at
   Wi-Fi speed when it answers, Bluetooth to the paired phone when not. The phone
   asks to accept.
@@ -56,7 +58,7 @@ picha recibe                     # e.g. exec-once in Hyprland
 `~/.config/picha/config.json` (all optional):
 
 ```json
-{ "name": "hachikuji", "dir": "~/Downloads", "lang": "es", "trusted": ["Daniel's S21"] }
+{ "name": "hachikuji", "dir": "~/Downloads", "lang": "es" }
 ```
 
 ## How it works

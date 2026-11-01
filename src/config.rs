@@ -15,7 +15,9 @@ pub struct Config {
     pub lang: String,
     /// TCP port phones connect to; 0 uses picha's fixed default.
     pub port: u16,
-    /// Phones whose transfers are accepted without asking, by the name they announce.
+    /// Phones whose transfers are accepted without asking: `bluetooth ADDRESS`,
+    /// or over Wi-Fi `NAME · NETWORK · UUID` (the name it announces, only on
+    /// that NetworkManager connection).
     pub trusted: Vec<String>,
     /// The lumbre's Wi-Fi password, made the first time it's lit.
     pub lumbre_password: String,
@@ -38,10 +40,14 @@ impl Config {
     }
 
     pub fn load() -> Self {
-        std::fs::read_to_string(Self::path())
+        let mut config: Self = std::fs::read_to_string(Self::path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // picha used to trust a phone over Wi-Fi by its name alone, on any
+        // network: those ask once more
+        config.trusted.retain(|t| t.starts_with("bluetooth ") || t.matches(" · ").count() >= 2);
+        config
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -50,8 +56,21 @@ impl Config {
         std::fs::write(path, serde_json::to_string_pretty(self).expect("config serializes") + "\n")
     }
 
-    pub fn is_trusted(&self, phone: &str) -> bool {
-        self.trusted.iter().any(|t| t == phone)
+    pub fn is_trusted(&self, key: &str) -> bool {
+        self.trusted.iter().any(|t| t == key)
+    }
+
+    /// A trusted key as shown: without the network's UUID.
+    pub fn label(key: &str) -> &str {
+        key.rsplit_once(" · ").map_or(key, |(shown, _)| shown)
+    }
+
+    /// Stops trusting `phone`: a key, its label, or the phone's name (on every
+    /// network); whether there was any.
+    pub fn forget(&mut self, phone: &str) -> bool {
+        let before = self.trusted.len();
+        self.trusted.retain(|t| t != phone && Self::label(t) != phone && t.split(" · ").next() != Some(phone));
+        self.trusted.len() != before
     }
 
     pub fn hostname() -> String {

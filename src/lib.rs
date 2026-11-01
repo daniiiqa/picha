@@ -6,6 +6,7 @@ pub mod error;
 pub mod look;
 pub mod lumbre;
 pub mod mdns;
+pub mod net;
 pub mod pantalla;
 pub mod proto;
 pub mod receive;
