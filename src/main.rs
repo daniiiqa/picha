@@ -105,7 +105,10 @@ async fn main() -> ExitCode {
         };
     }
     let result = match cli.cmd.unwrap_or(Cmd::Recibe { dir: None }) {
-        Cmd::Recibe { dir } => receive_forever(&config, dir.unwrap_or_else(|| config.dir())).await,
+        Cmd::Recibe { dir } => {
+            log_to_file();
+            receive_forever(&config, dir.unwrap_or_else(|| config.dir())).await
+        }
         Cmd::Pantalla { addr, empareja, audio, apagada, ya } => pantalla(Lang(config.spanish()), addr, empareja, audio, apagada, ya).await,
         Cmd::Confianza => {
             for key in &config.trusted {
@@ -132,6 +135,28 @@ async fn main() -> ExitCode {
                     .status();
             }
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Started by Hyprland (no terminal), the receiver's output would go nowhere:
+/// it goes to ~/.local/state/picha/recibe.log instead (the last ~1 MB, plus .old).
+fn log_to_file() {
+    use std::os::fd::AsRawFd;
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return;
+    }
+    let dir = picha::state::dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("recibe.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1_000_000) {
+        let _ = std::fs::rename(&path, dir.join("recibe.log.old"));
+    }
+    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        // SAFETY: dup2 on fds this process owns; the file stays open through 1 and 2
+        unsafe {
+            libc::dup2(file.as_raw_fd(), 1);
+            libc::dup2(file.as_raw_fd(), 2);
         }
     }
 }

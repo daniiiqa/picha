@@ -1498,6 +1498,7 @@ dependencies = [
  "futures-util",
  "hkdf",
  "hmac",
+ "libc",
  "mdns-sd",
  "p256",
  "prost",
