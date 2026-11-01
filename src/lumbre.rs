@@ -109,6 +109,13 @@ fn wait_for_card() -> Option<Wifi> {
 /// Airplane mode is the usual way to be "without network", so if the radio is off it
 /// turns it on for the lumbre (and `stop` turns it back off).
 pub fn start() -> Result<Lumbre> {
+    // NetworkManager's hotspot hands out addresses with dnsmasq; without it the hotspot
+    // comes up and then fails at "IP config", after the Wi-Fi was already dropped.
+    let has_dnsmasq = std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).chain(["/usr/bin".into(), "/usr/sbin".into()]).any(|d| d.join("dnsmasq").is_file()));
+    if !has_dnsmasq {
+        return Err(protocol("lumbre needs dnsmasq: sudo pacman -S dnsmasq"));
+    }
     let _ = std::fs::create_dir_all(crate::state::dir());
     if radio_blocked() {
         rfkill("unblock")?;

@@ -10,6 +10,7 @@ depends=('gcc-libs' 'glibc' 'bluez' 'bluez-obex')
 makedepends=('cargo')
 optdepends=(
   'networkmanager: lumbre, the laptop'"'"'s own Wi-Fi when there is no network'
+  'dnsmasq: lumbre (addresses for the phone)'
   'scrcpy: the phone'"'"'s screen'
   'android-tools: the phone'"'"'s screen (adb)'
   'wl-clipboard: received text to the clipboard'

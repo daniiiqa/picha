@@ -33,7 +33,7 @@ look changes. Without discada it uses sensible defaults and the terminal's color
 cargo install --path . --root ~/.local
 ```
 
-Needs: BlueZ with `bluez-obex` (Bluetooth), NetworkManager (lumbre), and for the
+Needs: BlueZ with `bluez-obex` (Bluetooth), NetworkManager and dnsmasq (lumbre), and for the
 phone's screen `scrcpy` and `android-tools`. Optional: `taco` (picks files for
 sending), `wl-clipboard` (text to the clipboard).
 
