@@ -19,12 +19,14 @@ const CHUNK: usize = 512 * 1024;
 /// (file index, bytes of it sent, its size).
 pub type Progress = (usize, u64, u64);
 
-/// Sends `files` over `stream`, connected to a Quick Share server. `on_pin` gets the PIN as soon as both sides
+/// Sends `files` and maybe `text` over `stream`, connected to a Quick Share server.
+/// A text lands as a notification (and the clipboard) on picha, not as a file. `on_pin` gets the PIN as soon as both sides
 /// know it, so it can be shown while the other side decides.
 pub async fn send(
     mut stream: TcpStream,
     me: &Endpoint,
     files: &[PathBuf],
+    text: Option<&str>,
     on_pin: impl FnOnce(&str),
     progress: Option<tokio::sync::mpsc::Sender<Progress>>,
 ) -> Result<()> {
@@ -47,6 +49,7 @@ pub async fn send(
         offered.push((i64::from_le_bytes(random_bytes::<8>()), name.to_string(), size, String::new()));
     }
 
+    let text = text.map(|t| (i64::from_le_bytes(random_bytes::<8>()), t));
     let mut assembler = Assembler::default();
     loop {
         let raw = wire::read_frame(&mut stream).await?;
@@ -66,7 +69,7 @@ pub async fn send(
                 let reply = match inner.r#type.and_then(|t| share_v1::FrameType::try_from(t).ok()) {
                     Some(share_v1::FrameType::PairedKeyEncryption) => vec![share::paired_key_encryption()],
                     Some(share_v1::FrameType::PairedKeyResult) => {
-                        vec![share::paired_key_result(), share::introduction(&offered)]
+                        vec![share::paired_key_result(), share::introduction(&offered, text)]
                     }
                     Some(share_v1::FrameType::Response) => {
                         let status = inner.connection_response.and_then(|r| r.status);
@@ -80,6 +83,11 @@ pub async fn send(
                                 }
                             })
                             .await?;
+                        }
+                        if let Some((id, t)) = text {
+                            for chunk in wire::bytes_payload_with_id(id, t.as_bytes().to_vec()) {
+                                wire::write_frame(&mut stream, &channel.seal(&chunk)).await?;
+                            }
                         }
                         Vec::new()
                     }

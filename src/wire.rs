@@ -188,8 +188,12 @@ pub fn payload_chunk(
 
 /// A whole bytes payload as the two chunks Android expects.
 pub fn bytes_payload(data: Vec<u8>) -> [Vec<u8>; 2] {
+    bytes_payload_with_id(i64::from_le_bytes(random_bytes::<8>()), data)
+}
+
+/// The same with a chosen id: a text's, announced in the introduction.
+pub fn bytes_payload_with_id(id: i64, data: Vec<u8>) -> [Vec<u8>; 2] {
     use payload_transfer_frame::payload_header::PayloadType;
-    let id = i64::from_le_bytes(random_bytes::<8>());
     let len = data.len() as i64;
     [
         payload_chunk(id, PayloadType::Bytes, len, 0, data, false),
@@ -233,8 +237,9 @@ pub mod share {
 
     use crate::crypto::random_bytes;
     use crate::proto::share::{
-        connection_response_frame, file_metadata, frame, paired_key_result_frame, v1_frame, ConnectionResponseFrame,
-        FileMetadata, Frame, IntroductionFrame, PairedKeyEncryptionFrame, PairedKeyResultFrame, V1Frame,
+        connection_response_frame, file_metadata, frame, paired_key_result_frame, text_metadata, v1_frame,
+        ConnectionResponseFrame, FileMetadata, Frame, IntroductionFrame, PairedKeyEncryptionFrame, PairedKeyResultFrame,
+        TextMetadata, V1Frame,
     };
 
     pub use connection_response_frame::Status;
@@ -276,7 +281,8 @@ pub mod share {
     }
 
     /// (payload id, name, size, mime type) of each file about to be sent.
-    pub fn introduction(files: &[(i64, String, i64, String)]) -> Vec<u8> {
+    /// Files (payload id, name, size, mime) and maybe a text (payload id, the text).
+    pub fn introduction(files: &[(i64, String, i64, String)], text: Option<(i64, &str)>) -> Vec<u8> {
         share(v1_frame::FrameType::Introduction, |v1| {
             v1.introduction = Some(IntroductionFrame {
                 file_metadata: files
@@ -290,6 +296,28 @@ pub mod share {
                         id: Some(i64::from_le_bytes(random_bytes::<8>())),
                         ..Default::default()
                     })
+                    .collect(),
+                text_metadata: text
+                    .map(|(id, text)| {
+                        let one_line = text.trim();
+                        let kind = if !one_line.contains(char::is_whitespace)
+                            && (one_line.starts_with("http://") || one_line.starts_with("https://"))
+                        {
+                            text_metadata::Type::Url
+                        } else {
+                            text_metadata::Type::Text
+                        };
+                        TextMetadata {
+                            // what Android shows before opening it
+                            text_title: Some(text.chars().take(60).collect()),
+                            r#type: Some(kind as i32),
+                            payload_id: Some(id),
+                            size: Some(text.len() as i64),
+                            id: Some(i64::from_le_bytes(random_bytes::<8>())),
+                            ..Default::default()
+                        }
+                    })
+                    .into_iter()
                     .collect(),
                 ..Default::default()
             })

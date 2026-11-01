@@ -27,12 +27,15 @@ const INFO_TIMEOUT: Duration = Duration::from_secs(60);
 #[command(
     name = "picha",
     version,
-    about = "Your phone and your laptop, a la carne asada: picha opens the menu, picha foto.jpg sends it to the phone",
+    about = "Your phone and your computers, a la carne asada: picha opens the menu, picha foto.jpg sends it, picha -t \"…\" sends a text",
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
-    /// Files to send to the phone
+    /// Files to send (you pick where to)
     files: Vec<PathBuf>,
+    /// A text to send: it arrives as a notification and in the clipboard, not as a file
+    #[arg(short = 't', long = "texto", value_name = "TEXT", conflicts_with = "files")]
+    text: Option<String>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -87,8 +90,12 @@ async fn main() -> ExitCode {
     let lang = Lang(config.spanish());
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
     // in a terminal: the menu, or sending; without one (Hyprland's startup): receiving
-    if cli.cmd.is_none() && (interactive || !cli.files.is_empty()) {
-        let start = if cli.files.is_empty() { tui::Start::Menu } else { tui::Start::Send(cli.files) };
+    if cli.cmd.is_none() && (interactive || !cli.files.is_empty() || cli.text.is_some()) {
+        let start = match cli.text {
+            Some(text) => tui::Start::Text(text),
+            None if cli.files.is_empty() => tui::Start::Menu,
+            None => tui::Start::Send(cli.files),
+        };
         return match tui::run(tui::Lang(lang.0), start).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {

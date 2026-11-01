@@ -1,12 +1,13 @@
 # picha
 
-Your Android phone and your Linux laptop, like Huawei Share — from the terminal,
+Your Android phone and your Linux computers, like Huawei Share — from the terminal,
 in the look of the [discada](https://github.com/daniiiqa/dotfiles) rice. *Yo te
 picho*, like the cheve at a carne asada.
 
 ```
-picha                  the menu: send · receive · phone screen · lumbre
-picha foto.jpg …       send it to the phone
+picha                  the menu: send files · send text · receive · phone screen · lumbre
+picha foto.jpg …       send it (you pick where to)
+picha -t "…"           send a text: a notification over there, no .txt
 picha pantalla         the phone's screen here
 ```
 
@@ -16,9 +17,13 @@ picha pantalla         the phone's screen here
   open or copy, text goes to the clipboard. "Siempre" trusts that phone from then on:
   over Bluetooth by its address, over Wi-Fi only on that network (anyone on a
   network can announce any phone's name, so trust doesn't follow you to the café).
-- **Send** to the phone: picha nudges it over Bluetooth LE, then uses Quick Share at
-  Wi-Fi speed when it answers, Bluetooth to the paired phone when not. The phone
-  asks to accept.
+- **Send** anywhere: a "where to?" list fills in as things show up — the phone
+  (picha nudges it over Bluetooth LE), other computers running `picha recibe` (or
+  Quick Share for Windows), and the paired phone over Bluetooth as the slow last
+  resort. The other side asks to accept.
+- **Send text**: typed or pasted (the page starts with your clipboard). It arrives
+  as a notification and in the clipboard on picha, as a text on the phone — no
+  `.txt` files piling up. Quick Share only (over Bluetooth it would be a file).
 - **The phone's screen** (scrcpy over Android's Wireless debugging or the cable):
   the clipboard goes both ways, drag files onto it to put them on the phone.
 - **Lumbre**: when there's no network, the laptop makes its own Wi-Fi; the menu

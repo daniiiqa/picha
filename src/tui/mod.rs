@@ -41,6 +41,8 @@ pub enum Start {
     Menu,
     /// `picha foto.jpg …`: send these right away.
     Send(Vec<PathBuf>),
+    /// `picha -t "…"`: send this text.
+    Text(String),
     /// `picha pantalla`: the phone's screen page.
     Screen { addr: Option<String>, audio: bool, screen_off: bool },
 }
@@ -49,13 +51,15 @@ pub enum Start {
 enum Page {
     Menu,
     Pick,
+    /// typing (or pasting) a text to send
+    Text,
     Sending,
     Receive,
     Screen,
     Lumbre,
 }
 
-const MENU: [Page; 4] = [Page::Pick, Page::Receive, Page::Screen, Page::Lumbre];
+const MENU: [Page; 5] = [Page::Pick, Page::Text, Page::Receive, Page::Screen, Page::Lumbre];
 
 enum ScreenStage {
     Searching(Instant),
@@ -113,6 +117,8 @@ impl Target {
 
 struct Sending {
     files: Vec<PathBuf>,
+    /// a text instead of files: a notification over there, no .txt
+    text: Option<String>,
     started: Instant,
     /// the picker: what was found so far, and whether one was picked
     targets: Vec<Target>,
@@ -174,6 +180,8 @@ struct App {
     want_taco: bool,
     // the lumbre
     lumbre_on: bool,
+    /// the send-text page's text
+    text_input: String,
     lumbre_busy: Option<Instant>,
     lumbre_rx: Option<mpsc::Receiver<std::result::Result<bool, String>>>,
 }
@@ -258,6 +266,7 @@ impl App {
             taco: which("taco"),
             want_taco: false,
             lumbre_on: lumbre::is_on(),
+            text_input: String::new(),
             lumbre_busy: None,
             lumbre_rx: None,
         };
@@ -267,6 +276,10 @@ impl App {
             Start::Send(files) => {
                 app.first = Page::Sending;
                 app.send(files);
+            }
+            Start::Text(text) => {
+                app.first = Page::Sending;
+                app.send_text(text);
             }
             Start::Screen { addr, audio, screen_off } => {
                 app.first = Page::Screen;
@@ -303,6 +316,7 @@ impl App {
             Page::Pick => self.entries = list_dir(&self.dir),
             Page::Screen => self.search_screen(),
             Page::Lumbre => self.lumbre_on = lumbre::is_on(),
+            Page::Text => self.text_input = clipboard().unwrap_or_default(),
             _ => {}
         }
     }
@@ -377,14 +391,24 @@ impl App {
     /// Opens the picker: the phone and computers on the network show up as they are
     /// found (the nudge wakes the phone), the paired phone over Bluetooth is last.
     fn send(&mut self, files: Vec<PathBuf>) {
+        self.start_send(files, None);
+    }
+
+    /// A text: only Quick Share carries it (Bluetooth would make it a .txt).
+    fn send_text(&mut self, text: String) {
+        self.start_send(Vec::new(), Some(text));
+    }
+
+    fn start_send(&mut self, files: Vec<PathBuf>, text: Option<String>) {
         self.page = Page::Sending;
         self.sel = 0;
         let (tx, rx) = mpsc::channel();
         let (seen_tx, seen) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(picha::send::discover(Duration::from_secs(15), seen_tx));
-        let targets = self.phones.first().cloned().map(Target::Bluetooth).into_iter().collect();
+        let targets = self.phones.first().cloned().filter(|_| text.is_none()).map(Target::Bluetooth).into_iter().collect();
         self.sending = Some(Sending {
             files,
+            text,
             started: Instant::now(),
             targets,
             chosen: false,
@@ -409,10 +433,11 @@ impl App {
         let Some(target) = s.targets.get(i).cloned() else { return };
         s.chosen = true;
         s.started = Instant::now();
-        let (files, tx, phone_addrs) = (s.files.clone(), s.tx.clone(), s.phone_addrs.subscribe());
+        let (files, text, tx, phone_addrs) = (s.files.clone(), s.text.clone(), s.tx.clone(), s.phone_addrs.subscribe());
+        let paired = paired.filter(|_| text.is_none());
         tokio::spawn(async move {
-            picha::send::log(&format!("send {} file(s) to {} · lumbre {}", files.len(), target.name(), lumbre::is_on()));
-            let done = route_and_send(files, target, paired, phone_addrs, tx.clone()).await;
+            picha::send::log(&format!("send {} file(s), text {} to {} · lumbre {}", files.len(), text.is_some(), target.name(), lumbre::is_on()));
+            let done = route_and_send(files, text, target, paired, phone_addrs, tx.clone()).await;
             picha::send::log(&format!("result: {done:?}"));
             let _ = tx.send(Update::Done(done));
         });
@@ -450,6 +475,7 @@ impl App {
             Page::Receive => 1 + self.recent.len() + self.trusted.len(),
             Page::Screen => self.screen_items().len(),
             Page::Lumbre => 2,
+            Page::Text => 0,
             Page::Sending => self.sending.as_ref().filter(|s| !s.chosen).map_or(0, |s| s.targets.len()),
         }
     }
@@ -477,10 +503,24 @@ impl App {
             Page::Sending => self.send_to(i),
             Page::Lumbre if i == 0 => self.toggle_lumbre(),
             Page::Lumbre => self.back(),
+            Page::Text => {}
         }
     }
 
     fn key(&mut self, code: KeyCode) {
+        if self.page == Page::Text {
+            match code {
+                KeyCode::Esc => self.back(),
+                KeyCode::Enter if !self.text_input.trim().is_empty() => {
+                    let text = std::mem::take(&mut self.text_input);
+                    self.send_text(text);
+                }
+                KeyCode::Backspace => drop(self.text_input.pop()),
+                KeyCode::Char(c) => self.text_input.push(c),
+                _ => {}
+            }
+            return;
+        }
         let n = self.rows_len();
         match code {
             KeyCode::Char('q') => self.quit = true,
@@ -592,12 +632,13 @@ impl App {
         let paired = self.phones.first().cloned();
         if let Some(s) = self.sending.as_mut() {
             let before = s.targets.get(self.sel).map(|t| t.name().to_string());
-            if let Some(p) = paired.filter(|_| !s.targets.iter().any(|t| matches!(t, Target::Bluetooth(_)))) {
+            let paired_name = paired.as_ref().map(|p| p.name.clone());
+            if let Some(p) = paired.filter(|_| s.text.is_none() && !s.targets.iter().any(|t| matches!(t, Target::Bluetooth(_)))) {
                 s.targets.push(Target::Bluetooth(p));
             }
             while let Ok(seen) = s.seen.try_recv() {
                 if seen.is_phone() {
-                    let name = seen.endpoint.as_ref().map(|e| e.name.clone()).or_else(|| paired_name(&s.targets)).unwrap_or_else(|| "cel".into());
+                    let name = seen.endpoint.as_ref().map(|e| e.name.clone()).or_else(|| paired_name.clone()).unwrap_or_else(|| "cel".into());
                     match s.targets.iter_mut().find(|t| matches!(t, Target::Phone { .. })) {
                         Some(Target::Phone { addrs, .. }) => {
                             // the newest announcement first: the older ones may be stale
@@ -686,14 +727,11 @@ fn choose_with_taco() -> Vec<PathBuf> {
     std::fs::read_to_string(&out).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect()
 }
 
-fn paired_name(targets: &[Target]) -> Option<String> {
-    targets.iter().find_map(|t| if let Target::Bluetooth(p) = t { Some(p.name.clone()) } else { None })
-}
-
 /// Quick Share to a computer; to the phone, Quick Share on whichever address it
 /// answers (waiting for its live announcement), else Bluetooth.
 async fn route_and_send(
     files: Vec<PathBuf>,
+    text: Option<String>,
     target: Target,
     paired: Option<Phone>,
     mut phone_addrs: tokio::sync::watch::Receiver<Vec<std::net::SocketAddr>>,
@@ -722,7 +760,11 @@ async fn route_and_send(
                     if refused {
                         let _ = tx.send(Update::Why(picha::send::Miss::Refused));
                     }
-                    let phone = paired.ok_or("the phone didn't answer, and none is paired over Bluetooth")?;
+                    let phone = paired.ok_or(if text.is_some() {
+                        "the phone didn't answer over Wi-Fi (a text needs Quick Share)"
+                    } else {
+                        "the phone didn't answer, and none is paired over Bluetooth"
+                    })?;
                     return send_bluetooth(&files, &phone, &tx).await;
                 }
             }
@@ -738,7 +780,7 @@ async fn route_and_send(
         }
     });
     let pin_tx = tx.clone();
-    picha::send::send(stream, &me, &files, move |pin| drop(pin_tx.send(Update::Pin(pin.to_string()))), Some(ptx))
+    picha::send::send(stream, &me, &files, text.as_deref(), move |pin| drop(pin_tx.send(Update::Pin(pin.to_string()))), Some(ptx))
         .await
         .map_err(|e| e.to_string())
 }
@@ -818,7 +860,8 @@ fn draw(f: &mut Frame, app: &mut App) {
     let [body, footer] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
     let title = match app.page {
         Page::Menu => th.label("󰄜", "picha", "picha"),
-        Page::Pick => th.label("󰒋", lang.t("mandar", "send"), lang.t("mandar al cel", "send to the phone")),
+        Page::Pick => th.label("󰒋", lang.t("mandar", "send"), lang.t("mandar archivos", "send files")),
+        Page::Text => th.label("󰦨", lang.t("texto", "text"), lang.t("mandar texto", "send text")),
         Page::Sending => th.label("󰒋", lang.t("mandar", "send"), lang.t("mandando", "sending")),
         Page::Receive => th.label("󰇚", lang.t("recibir", "receive"), lang.t("recibir", "receive")),
         Page::Screen => th.label("󰹑", lang.t("pantalla", "screen"), lang.t("pantalla del cel", "phone screen")),
@@ -836,6 +879,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         Page::Receive => draw_receive(f, app, inner),
         Page::Screen => draw_screen(f, app, inner),
         Page::Lumbre => draw_lumbre(f, app, inner),
+        Page::Text => draw_text(f, app, inner),
     };
     let th = &app.theme;
     let line = match &app.note {
@@ -890,7 +934,8 @@ fn draw_menu(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
         (true, false) => lang.t("visible", "visible"),
     };
     let items = vec![
-        format!("{}{}", icon(th, "󰒋"), lang.t("mandar al cel", "send to the phone")),
+        format!("{}{}", icon(th, "󰒋"), lang.t("mandar archivos", "send files")),
+        format!("{}{}", icon(th, "󰦨"), lang.t("mandar texto", "send text")),
         format!("{}{}  · {receiving}", icon(th, "󰇚"), lang.t("recibir", "receive")),
         format!("{}{}", icon(th, "󰹑"), lang.t("pantalla del cel", "phone screen")),
         format!(
@@ -980,6 +1025,15 @@ fn draw_sending(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
         lines.push(Line::styled(th.case(&format!("PIN {pin} · {}", lang.t("el mismo que allá", "the same as over there"))), th.acc2));
     }
     lines.push(Line::default());
+    if let Some(text) = &s.text {
+        let preview: String = text.lines().next().unwrap_or_default().chars().take(60).collect();
+        let state = match &s.result {
+            Some(Ok(())) => Span::styled("  ✓", th.acc),
+            Some(Err(_)) => Span::styled("  ✗", th.warn),
+            None => Span::raw(""),
+        };
+        lines.push(Line::from(vec![Span::styled(format!("{}{preview}", icon(th, "󰦨")), th.fg), state]));
+    }
     for (n, file) in s.files.iter().enumerate() {
         let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let state = match (&s.result, n.cmp(&i)) {
@@ -1010,6 +1064,27 @@ fn draw_sending(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
     if s.result.is_some() { lang.t("enter volver · q salir", "enter back · q quit") } else { lang.t("q salir", "q quit") }
 }
 
+/// The clipboard (wl-paste), when it holds a not-too-long text.
+fn clipboard() -> Option<String> {
+    let out = std::process::Command::new("wl-paste").args(["-n", "-t", "text"]).stderr(std::process::Stdio::null()).output().ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    (out.status.success() && text.len() <= 10_000).then_some(text)
+}
+
+/// Send text: what's typed (the clipboard to start with), wrapped.
+fn draw_text(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
+    let (th, lang) = (&app.theme, app.lang);
+    let mut lines = vec![
+        Line::styled(th.case(lang.t("llega como notificación (y al portapapeles), sin archivo", "arrives as a notification (and the clipboard), no file")), th.dim),
+        Line::default(),
+    ];
+    let mut shown = app.text_input.clone();
+    shown.push('▏');
+    lines.extend(shown.lines().map(|l| Line::styled(l.to_string(), th.fg)));
+    f.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }), area);
+    lang.t("escribe o pega · enter mandar · esc volver", "type or paste · enter send · esc back")
+}
+
 /// Where to: the targets as they're found, the files below.
 fn draw_picker(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
     let (th, lang) = (&app.theme, app.lang);
@@ -1032,6 +1107,7 @@ fn draw_picker(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
         })
         .collect();
     let files = s.files.len();
+    let is_text = s.text.is_some();
     if rows.is_empty() {
         f.render_widget(
             Paragraph::new(Line::styled(th.case(lang.t("nada todavía: ¿el cel desbloqueado, la otra compu con picha?", "nothing yet: phone unlocked, the other computer running picha?")), th.dim)),
@@ -1052,7 +1128,13 @@ fn draw_picker(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
     }
     let th = &app.theme;
     if y + 1 < area.bottom() {
-        let what = if files == 1 { lang.t("1 archivo", "1 file").to_string() } else { format!("{files} {}", lang.t("archivos", "files")) };
+        let what = if is_text {
+            lang.t("un texto", "a text").to_string()
+        } else if files == 1 {
+            lang.t("1 archivo", "1 file").to_string()
+        } else {
+            format!("{files} {}", lang.t("archivos", "files"))
+        };
         f.render_widget(Paragraph::new(Line::styled(th.case(&what), th.dim)), Rect::new(area.x, y + 1, area.width, 1));
     }
     lang.t("↑↓ elegir · enter mandar · esc volver", "↑↓ pick · enter send · esc back")

@@ -56,7 +56,7 @@ async fn sends_files_end_to_end() {
     let phone = Endpoint { name: "S21 de prueba".into(), kind: DeviceKind::Phone };
     let files = [src.join("video.mp4"), src.join("nota.txt"), src.join("vacío")];
     let mut sender_pin = String::new();
-    send::send(tokio::net::TcpStream::connect(addr).await.unwrap(), &phone, &files, |p| sender_pin = p.to_string(), None).await.unwrap();
+    send::send(tokio::net::TcpStream::connect(addr).await.unwrap(), &phone, &files, None, |p| sender_pin = p.to_string(), None).await.unwrap();
 
     let (pin, mut saved, result) = receiver.await.unwrap();
     result.unwrap();
@@ -75,7 +75,7 @@ async fn rejecting_leaves_nothing_behind() {
 
     let (addr, receiver) = receiver(out.clone(), false).await;
     let phone = Endpoint { name: "S21 de prueba".into(), kind: DeviceKind::Phone };
-    let sent = send::send(tokio::net::TcpStream::connect(addr).await.unwrap(), &phone, &[src.join("foto.jpg")], |_| {}, None).await;
+    let sent = send::send(tokio::net::TcpStream::connect(addr).await.unwrap(), &phone, &[src.join("foto.jpg")], None, |_| {}, None).await;
     assert!(matches!(sent, Err(Error::Rejected)), "{sent:?}");
 
     let (_, saved, result) = receiver.await.unwrap();
@@ -97,4 +97,36 @@ fn activity_file_lives_while_the_transfer_does() {
     drop(a);
     assert_eq!(std::fs::read_dir(dir.join("picha")).unwrap().count(), 0);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn sends_text_without_a_file() {
+    let out = temp_dir("text");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = out.clone();
+    let got = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        let handler = tokio::spawn(async move { receive::handle(stream, &dir, tx).await });
+        let mut text = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                Event::Offer(offer, answer) => {
+                    assert!(offer.files.is_empty() && offer.text.is_some());
+                    answer.send(true).unwrap();
+                }
+                Event::Text(_, t) => text = Some(t),
+                _ => {}
+            }
+        }
+        handler.await.unwrap().unwrap();
+        text
+    });
+    let me = Endpoint { name: "laptop de prueba".into(), kind: DeviceKind::Laptop };
+    let msg = "la contraseña del wifi: carne asada 🔥";
+    send::send(tokio::net::TcpStream::connect(addr).await.unwrap(), &me, &[], Some(msg), |_| {}, None).await.unwrap();
+    assert_eq!(got.await.unwrap().as_deref(), Some(msg));
+    // nothing written to disk
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
 }
