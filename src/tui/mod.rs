@@ -560,6 +560,14 @@ fn choose_with_taco() -> Vec<PathBuf> {
 
 /// Quick Share if the phone shows up on the network after the nudge, else Bluetooth.
 async fn route_and_send(files: Vec<PathBuf>, paired: Option<Phone>, tx: mpsc::Sender<Update>) -> Result<(), String> {
+    let wifi = lumbre::wifi();
+    picha::send::log(&format!("send {} file(s) · wifi {:?} · lumbre {}", files.len(), wifi.and_then(|w| w.network), lumbre::is_on()));
+    let r = route_and_send_inner(files, paired, tx).await;
+    picha::send::log(&format!("result: {r:?}"));
+    r
+}
+
+async fn route_and_send_inner(files: Vec<PathBuf>, paired: Option<Phone>, tx: mpsc::Sender<Update>) -> Result<(), String> {
     use picha::wire::{DeviceKind, Endpoint};
     if let Some((addr, endpoint)) = picha::send::find_phone(Duration::from_secs(6)).await {
         let to = endpoint.map(|e| e.name).or_else(|| paired.as_ref().map(|p| p.name.clone())).unwrap_or_else(|| "cel".into());
@@ -581,6 +589,7 @@ async fn route_and_send(files: Vec<PathBuf>, paired: Option<Phone>, tx: mpsc::Se
         Some(p) => p,
         None => bt::phones().await.into_iter().next().ok_or("no phone found, on the network or paired over Bluetooth")?,
     };
+    picha::send::log(&format!("bluetooth to {} {}", phone.name, phone.address));
     let _ = tx.send(Update::Via(false, phone.name.clone()));
     let (ptx, mut prx) = tokio::sync::mpsc::channel::<bt::SendProgress>(64);
     let fwd = tx.clone();

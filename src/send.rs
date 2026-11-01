@@ -123,6 +123,16 @@ async fn stream_file(
     wire::write_frame(stream, &channel.seal(&last)).await
 }
 
+/// One line in ~/.local/state/picha/manda.log: what sending tried, for when it fails.
+pub fn log(what: &str) {
+    use std::io::Write;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let _ = std::fs::create_dir_all(crate::state::dir());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(crate::state::dir().join("manda.log")) {
+        let _ = writeln!(f, "[{}] {what}", now);
+    }
+}
+
 /// Nudges nearby phones over Bluetooth LE and waits up to `wait` for one to show up
 /// on the network as a Quick Share receiver: its address and how it describes
 /// itself (hidden phones give no name). Not this laptop's own receiver.
@@ -130,7 +140,16 @@ pub async fn find_phone(wait: std::time::Duration) -> Option<(SocketAddr, Option
     use base64::Engine;
     use mdns_sd::{ServiceDaemon, ServiceEvent};
 
-    let nudge = crate::ble::nudge().await.ok();
+    let nudge = match crate::ble::nudge().await {
+        Ok(n) => {
+            log("nudge: advertising fe2c");
+            Some(n)
+        }
+        Err(e) => {
+            log(&format!("nudge failed: {e}"));
+            None
+        }
+    };
     let mdns = ServiceDaemon::new().ok()?;
     let events = mdns.browse("_FC9F5ED42C8A._tcp.local.").ok()?;
     let me = crate::config::Config::load();
@@ -143,6 +162,13 @@ pub async fn find_phone(wait: std::time::Duration) -> Option<(SocketAddr, Option
             .and_then(|t| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(t).ok())
             .unwrap_or_default();
         let endpoint = Endpoint::decode(&raw).ok();
+        log(&format!(
+            "mdns: {} name={:?} addrs={:?} port={}",
+            info.get_fullname(),
+            endpoint.as_ref().map(|e| e.name.clone()),
+            info.get_addresses(),
+            info.get_port()
+        ));
         if endpoint.as_ref().is_some_and(|e| e.name == me.name()) && info.get_port() == me.port() {
             continue;
         }
@@ -151,6 +177,7 @@ pub async fn find_phone(wait: std::time::Duration) -> Option<(SocketAddr, Option
             break;
         }
     }
+    log(&format!("find_phone: {:?}", found.as_ref().map(|f| f.0)));
     let _ = mdns.shutdown();
     if let Some(n) = nudge {
         n.stop().await;
