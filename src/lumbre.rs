@@ -117,6 +117,9 @@ pub fn start() -> Result<Lumbre> {
         return Err(protocol("lumbre needs dnsmasq: sudo pacman -S dnsmasq"));
     }
     let _ = std::fs::create_dir_all(crate::state::dir());
+    // leftovers from an attempt that died halfway
+    let _ = std::fs::remove_file(radio_off_file());
+    let _ = std::fs::remove_file(previous_file());
     if radio_blocked() {
         rfkill("unblock")?;
         let _ = std::fs::write(radio_off_file(), "");
@@ -127,9 +130,12 @@ pub fn start() -> Result<Lumbre> {
         let _ = std::fs::write(previous_file(), net);
     }
     let l = Lumbre::get();
-    nmcli(&[
+    if let Err(e) = nmcli(&[
         "device", "wifi", "hotspot", "ifname", &card.device, "con-name", CONNECTION, "ssid", &l.ssid, "band", "bg", "password", &l.password,
-    ])?;
+    ]) {
+        let _ = stop(); // back to the Wi-Fi, or to airplane mode
+        return Err(e);
+    }
     Ok(l)
 }
 
