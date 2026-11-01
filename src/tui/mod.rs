@@ -83,6 +83,8 @@ struct Entry {
 enum Update {
     /// The route: Quick Share over Wi-Fi (true) or Bluetooth (false), and to whom.
     Via(bool, String),
+    /// why it isn't Quick Share
+    Why(picha::send::Miss),
     Pin(String),
     Progress(usize, u64, u64),
     Done(Result<(), String>),
@@ -93,6 +95,7 @@ struct Sending {
     started: Instant,
     /// None while looking for the phone.
     via: Option<(bool, String)>,
+    why: Option<picha::send::Miss>,
     pin: Option<String>,
     progress: (usize, u64, u64),
     rx: mpsc::Receiver<Update>,
@@ -350,7 +353,7 @@ impl App {
             let done = route_and_send(list, paired, tx.clone()).await;
             let _ = tx.send(Update::Done(done));
         });
-        self.sending = Some(Sending { files, started: Instant::now(), via: None, pin: None, progress: (0, 0, 0), rx, result: None });
+        self.sending = Some(Sending { files, started: Instant::now(), via: None, why: None, pin: None, progress: (0, 0, 0), rx, result: None });
     }
 
     fn pick_open(&mut self) {
@@ -516,6 +519,7 @@ impl App {
             while let Ok(u) = s.rx.try_recv() {
                 match u {
                     Update::Via(wifi, to) => s.via = Some((wifi, to)),
+                    Update::Why(why) => s.why = Some(why),
                     Update::Pin(pin) => s.pin = Some(pin),
                     Update::Progress(i, sent, total) => s.progress = (i, sent, total),
                     Update::Done(r) => s.result = Some(r),
@@ -569,7 +573,11 @@ async fn route_and_send(files: Vec<PathBuf>, paired: Option<Phone>, tx: mpsc::Se
 
 async fn route_and_send_inner(files: Vec<PathBuf>, paired: Option<Phone>, tx: mpsc::Sender<Update>) -> Result<(), String> {
     use picha::wire::{DeviceKind, Endpoint};
-    if let Some((stream, _addr, endpoint)) = picha::send::find_phone(Duration::from_secs(10)).await {
+    let found = picha::send::find_phone(Duration::from_secs(10)).await;
+    if let Err(picha::send::Miss::Refused) = found {
+        let _ = tx.send(Update::Why(picha::send::Miss::Refused));
+    }
+    if let Ok((stream, _addr, endpoint)) = found {
         let to = endpoint.map(|e| e.name).or_else(|| paired.as_ref().map(|p| p.name.clone())).unwrap_or_else(|| "cel".into());
         let _ = tx.send(Update::Via(true, to));
         let me = Endpoint { name: Config::load().name(), kind: DeviceKind::Laptop };
@@ -814,6 +822,9 @@ fn draw_sending(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
             ),
         ]),
     }];
+    if s.why == Some(picha::send::Miss::Refused) {
+        lines.push(Line::styled(th.case(lang.t("¿Quick Share apagado en el cel?", "Quick Share off on the phone?")), th.dim));
+    }
     if let Some(pin) = &s.pin {
         lines.push(Line::styled(th.case(&format!("PIN {pin} · {}", lang.t("el mismo que en el cel", "same as on the phone"))), th.acc2));
     }

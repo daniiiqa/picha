@@ -132,13 +132,22 @@ pub fn log(what: &str) {
     }
 }
 
+/// Why no phone was reached over the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Miss {
+    /// Nothing answered on the network: not on the same Wi-Fi, or asleep.
+    NotSeen,
+    /// It announced itself but refused the connection: Quick Share is off on it.
+    Refused,
+}
+
 /// Nudges nearby phones over Bluetooth LE and waits up to `wait` for one to show up
 /// on the network as a Quick Share receiver: a connection to it, its address and how
 /// it describes itself (hidden phones give no name). Not this laptop's own receiver.
 /// A phone can still answer mDNS with a port it no longer serves (its announcement
 /// from before the nudge), so each candidate is dialed and a refusal means keep
 /// waiting for the live one.
-pub async fn find_phone(wait: std::time::Duration) -> Option<(TcpStream, SocketAddr, Option<Endpoint>)> {
+pub async fn find_phone(wait: std::time::Duration) -> std::result::Result<(TcpStream, SocketAddr, Option<Endpoint>), Miss> {
     use base64::Engine;
     use mdns_sd::{ServiceDaemon, ServiceEvent};
 
@@ -152,8 +161,9 @@ pub async fn find_phone(wait: std::time::Duration) -> Option<(TcpStream, SocketA
             None
         }
     };
-    let mdns = ServiceDaemon::new().ok()?;
-    let events = mdns.browse("_FC9F5ED42C8A._tcp.local.").ok()?;
+    let mdns = ServiceDaemon::new().map_err(|_| Miss::NotSeen)?;
+    let events = mdns.browse("_FC9F5ED42C8A._tcp.local.").map_err(|_| Miss::NotSeen)?;
+    let mut refused = false;
     let me = crate::config::Config::load();
     let deadline = std::time::Instant::now() + wait;
     let mut found = None;
@@ -192,7 +202,10 @@ pub async fn find_phone(wait: std::time::Duration) -> Option<(TcpStream, SocketA
                     found = Some((stream, addr, endpoint.clone()));
                     break;
                 }
-                Ok(Err(e)) => log(&format!("dial {addr}: {e} (trying the next address)")),
+                Ok(Err(e)) => {
+                    refused = true;
+                    log(&format!("dial {addr}: {e} (trying the next address)"));
+                }
                 Err(_) => log(&format!("dial {addr}: timed out")),
             }
         }
@@ -205,5 +218,5 @@ pub async fn find_phone(wait: std::time::Duration) -> Option<(TcpStream, SocketA
     if let Some(n) = nudge {
         n.stop().await;
     }
-    found
+    found.ok_or(if refused { Miss::Refused } else { Miss::NotSeen })
 }

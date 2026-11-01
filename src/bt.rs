@@ -198,6 +198,28 @@ pub type SendProgress = (usize, u64, u64);
 
 /// Pushes `files` to a paired phone over Bluetooth, one after another. The phone
 /// asks its user to accept each one.
+/// complete → Some(true), error → Some(false), still going → None.
+fn finished(status: &str) -> Option<bool> {
+    match status {
+        "complete" => Some(true),
+        "error" => Some(false),
+        _ => None,
+    }
+}
+
+/// The Status in a PropertiesChanged signal from the transfer at `path`.
+fn transfer_status(msg: &zbus::Message, path: &str) -> Option<String> {
+    use std::collections::HashMap;
+    if msg.header().path().map(|p| p.as_str()) != Some(path) {
+        return None;
+    }
+    let (iface, changed, _): (String, HashMap<String, zbus::zvariant::OwnedValue>, Vec<String>) = msg.body().deserialize().ok()?;
+    if iface != "org.bluez.obex.Transfer1" {
+        return None;
+    }
+    String::try_from(changed.get("Status")?.try_clone().ok()?).ok()
+}
+
 pub async fn send(address: &str, files: &[PathBuf], progress: mpsc::Sender<SendProgress>) -> Result<()> {
     use std::collections::HashMap;
     use zbus::zvariant::Value;
@@ -207,6 +229,17 @@ pub async fn send(address: &str, files: &[PathBuf], progress: mpsc::Sender<SendP
     let mut args: HashMap<&str, Value> = HashMap::new();
     args.insert("Target", Value::from("opp"));
     let obex_session: OwnedObjectPath = client.call("CreateSession", &(address, args)).await.map_err(err)?;
+    // obexd removes a transfer the moment it ends, cancelled or not, so its last Status
+    // only reaches us as a PropertiesChanged signal: listen before the first send.
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(OBEX)
+        .and_then(|b| b.interface("org.freedesktop.DBus.Properties"))
+        .and_then(|b| b.member("PropertiesChanged"))
+        .and_then(|b| b.path_namespace(obex_session.as_str()))
+        .map(|b| b.build())
+        .map_err(err)?;
+    let mut signals = zbus::MessageStream::for_match_rule(rule, &session, Some(64)).await.map_err(err)?;
     let result = async {
         let push = Proxy::new(&session, OBEX, obex_session.as_str(), "org.bluez.obex.ObjectPush1").await.map_err(err)?;
         for (i, file) in files.iter().enumerate() {
@@ -214,19 +247,38 @@ pub async fn send(address: &str, files: &[PathBuf], progress: mpsc::Sender<SendP
             let (transfer, _props): (OwnedObjectPath, HashMap<String, zbus::zvariant::OwnedValue>) =
                 push.call("SendFile", &(path.to_string_lossy().as_ref(),)).await.map_err(err)?;
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            loop {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                let t = transfer.as_str();
-                let status: zbus::Result<String> = property(&session, OBEX, t, "org.bluez.obex.Transfer1", "Status").await;
-                let sent: u64 = property(&session, OBEX, t, "org.bluez.obex.Transfer1", "Transferred").await.unwrap_or(0);
-                let _ = progress.try_send((i, sent, size));
-                match status.as_deref() {
-                    Ok("complete") => break,
-                    Ok("error") => return Err(protocol("the phone declined or the transfer failed")),
-                    Ok(_) => {}
-                    // the transfer object goes away as soon as it ends
-                    Err(_) => break,
+            let t = transfer.as_str();
+            let mut sent = 0u64;
+            let done = loop {
+                tokio::select! {
+                    msg = futures_util::StreamExt::next(&mut signals) => {
+                        if let Some(done) = msg.and_then(|m| m.ok()).and_then(|m| transfer_status(&m, t)).and_then(|s| finished(&s)) {
+                            break done;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(300)) => {
+                        let status: zbus::Result<String> = property(&session, OBEX, t, "org.bluez.obex.Transfer1", "Status").await;
+                        sent = property(&session, OBEX, t, "org.bluez.obex.Transfer1", "Transferred").await.unwrap_or(sent);
+                        let _ = progress.try_send((i, sent, size));
+                        match status.as_deref().map(finished) {
+                            Ok(Some(done)) => break done,
+                            Ok(None) => {}
+                            // gone: its last word is already queued as a signal, if it said one
+                            Err(_) => {
+                                let mut last = None;
+                                while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(300), futures_util::StreamExt::next(&mut signals)).await {
+                                    if let Some(status) = msg.ok().and_then(|m| transfer_status(&m, t)) {
+                                        last = finished(&status);
+                                    }
+                                }
+                                break last.unwrap_or(sent >= size);
+                            }
+                        }
+                    }
                 }
+            };
+            if !done {
+                return Err(protocol("cancelled or declined on the phone"));
             }
             let _ = progress.try_send((i, size, size));
         }
