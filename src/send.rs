@@ -174,14 +174,25 @@ pub async fn find_phone(wait: std::time::Duration) -> Option<(TcpStream, SocketA
         if endpoint.as_ref().is_some_and(|e| e.name == me.name()) && info.get_port() == me.port() {
             continue;
         }
-        for ip in info.get_addresses_v4() {
-            let addr = SocketAddr::new(std::net::IpAddr::V4(ip), info.get_port());
+        // IPv4 first; then IPv6, which on a network without internet (the lumbre) can
+        // be the only one the phone's server accepts.
+        let port = info.get_port();
+        let mut addrs: Vec<SocketAddr> =
+            info.get_addresses_v4().into_iter().map(|ip| SocketAddr::new(std::net::IpAddr::V4(ip), port)).collect();
+        addrs.extend(info.get_addresses().iter().filter_map(|a| match a {
+            mdns_sd::ScopedIp::V6(v6) => {
+                let scope = if v6.addr().is_unicast_link_local() { v6.scope_id().index } else { 0 };
+                Some(SocketAddr::V6(std::net::SocketAddrV6::new(*v6.addr(), port, 0, scope)))
+            }
+            _ => None,
+        }));
+        for addr in addrs {
             match tokio::time::timeout(std::time::Duration::from_secs(2), TcpStream::connect(addr)).await {
                 Ok(Ok(stream)) => {
                     found = Some((stream, addr, endpoint.clone()));
                     break;
                 }
-                Ok(Err(e)) => log(&format!("dial {addr}: {e} (stale announcement? waiting)")),
+                Ok(Err(e)) => log(&format!("dial {addr}: {e} (trying the next address)")),
                 Err(_) => log(&format!("dial {addr}: timed out")),
             }
         }
