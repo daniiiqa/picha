@@ -90,9 +90,39 @@ enum Update {
     Done(Result<(), String>),
 }
 
+/// Where a send can go, as the picker lists it.
+#[derive(Clone)]
+enum Target {
+    /// the phone on the network: every address it announced (it re-announces on each
+    /// wake-up, sometimes with a port it no longer serves)
+    Phone { name: String, addrs: Vec<std::net::SocketAddr> },
+    /// another computer: picha, or Quick Share for Windows
+    Computer { key: String, name: String, addrs: Vec<std::net::SocketAddr> },
+    /// a paired phone, over Bluetooth
+    Bluetooth(Phone),
+}
+
+impl Target {
+    fn name(&self) -> &str {
+        match self {
+            Target::Phone { name, .. } | Target::Computer { name, .. } => name,
+            Target::Bluetooth(p) => &p.name,
+        }
+    }
+}
+
 struct Sending {
     files: Vec<PathBuf>,
     started: Instant,
+    /// the picker: what was found so far, and whether one was picked
+    targets: Vec<Target>,
+    chosen: bool,
+    /// the user moved the selection (else it stays on the first, the fastest)
+    touched: bool,
+    seen: tokio::sync::mpsc::UnboundedReceiver<picha::send::Seen>,
+    /// the phone's addresses as they come, for a send already under way
+    phone_addrs: tokio::sync::watch::Sender<Vec<std::net::SocketAddr>>,
+    tx: mpsc::Sender<Update>,
     /// None while looking for the phone.
     via: Option<(bool, String)>,
     why: Option<picha::send::Miss>,
@@ -344,18 +374,48 @@ impl App {
         }
     }
 
-    /// Sends by the fastest route: Quick Share when the phone answers the nudge on
-    /// the network (the lumbre's too), else Bluetooth to the paired phone.
+    /// Opens the picker: the phone and computers on the network show up as they are
+    /// found (the nudge wakes the phone), the paired phone over Bluetooth is last.
     fn send(&mut self, files: Vec<PathBuf>) {
         self.page = Page::Sending;
+        self.sel = 0;
         let (tx, rx) = mpsc::channel();
-        let list = files.clone();
+        let (seen_tx, seen) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(picha::send::discover(Duration::from_secs(15), seen_tx));
+        let targets = self.phones.first().cloned().map(Target::Bluetooth).into_iter().collect();
+        self.sending = Some(Sending {
+            files,
+            started: Instant::now(),
+            targets,
+            chosen: false,
+            touched: false,
+            seen,
+            phone_addrs: tokio::sync::watch::channel(Vec::new()).0,
+            tx,
+            via: None,
+            why: None,
+            activity: None,
+            pin: None,
+            progress: (0, 0, 0),
+            rx,
+            result: None,
+        });
+    }
+
+    /// Sends to the picked target.
+    fn send_to(&mut self, i: usize) {
         let paired = self.phones.first().cloned();
+        let Some(s) = self.sending.as_mut() else { return };
+        let Some(target) = s.targets.get(i).cloned() else { return };
+        s.chosen = true;
+        s.started = Instant::now();
+        let (files, tx, phone_addrs) = (s.files.clone(), s.tx.clone(), s.phone_addrs.subscribe());
         tokio::spawn(async move {
-            let done = route_and_send(list, paired, tx.clone()).await;
+            picha::send::log(&format!("send {} file(s) to {} · lumbre {}", files.len(), target.name(), lumbre::is_on()));
+            let done = route_and_send(files, target, paired, phone_addrs, tx.clone()).await;
+            picha::send::log(&format!("result: {done:?}"));
             let _ = tx.send(Update::Done(done));
         });
-        self.sending = Some(Sending { files, started: Instant::now(), via: None, why: None, activity: None, pin: None, progress: (0, 0, 0), rx, result: None });
     }
 
     fn pick_open(&mut self) {
@@ -390,7 +450,7 @@ impl App {
             Page::Receive => 1 + self.recent.len() + self.trusted.len(),
             Page::Screen => self.screen_items().len(),
             Page::Lumbre => 2,
-            _ => 0,
+            Page::Sending => self.sending.as_ref().filter(|s| !s.chosen).map_or(0, |s| s.targets.len()),
         }
     }
 
@@ -414,9 +474,9 @@ impl App {
                     self.screen_choose(item);
                 }
             }
+            Page::Sending => self.send_to(i),
             Page::Lumbre if i == 0 => self.toggle_lumbre(),
             Page::Lumbre => self.back(),
-            _ => {}
         }
     }
 
@@ -425,10 +485,22 @@ impl App {
         match code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Esc => self.back(),
-            KeyCode::Up | KeyCode::Char('k') if n > 0 => self.sel = (self.sel + n - 1) % n,
-            KeyCode::Down | KeyCode::Char('j') if n > 0 => self.sel = (self.sel + 1) % n,
+            KeyCode::Up | KeyCode::Char('k') if n > 0 => {
+                self.sel = (self.sel + n - 1) % n;
+                self.touched();
+            }
+            KeyCode::Down | KeyCode::Char('j') if n > 0 => {
+                self.sel = (self.sel + 1) % n;
+                self.touched();
+            }
             KeyCode::Enter if n > 0 => self.activate(self.sel),
             _ => self.page_key(code),
+        }
+    }
+
+    fn touched(&mut self) {
+        if let Some(s) = self.sending.as_mut() {
+            s.touched = true;
         }
     }
 
@@ -517,7 +589,46 @@ impl App {
                 Err(e) => self.note = Some((e, true)),
             }
         }
+        let paired = self.phones.first().cloned();
         if let Some(s) = self.sending.as_mut() {
+            let before = s.targets.get(self.sel).map(|t| t.name().to_string());
+            if let Some(p) = paired.filter(|_| !s.targets.iter().any(|t| matches!(t, Target::Bluetooth(_)))) {
+                s.targets.push(Target::Bluetooth(p));
+            }
+            while let Ok(seen) = s.seen.try_recv() {
+                if seen.is_phone() {
+                    let name = seen.endpoint.as_ref().map(|e| e.name.clone()).or_else(|| paired_name(&s.targets)).unwrap_or_else(|| "cel".into());
+                    match s.targets.iter_mut().find(|t| matches!(t, Target::Phone { .. })) {
+                        Some(Target::Phone { addrs, .. }) => {
+                            // the newest announcement first: the older ones may be stale
+                            let mut fresh = seen.addrs.clone();
+                            fresh.extend(addrs.iter().filter(|a| !seen.addrs.contains(a)));
+                            *addrs = fresh;
+                        }
+                        _ => s.targets.insert(0, Target::Phone { name, addrs: seen.addrs.clone() }),
+                    }
+                    if let Some(Target::Phone { addrs, .. }) = s.targets.iter().find(|t| matches!(t, Target::Phone { .. })) {
+                        s.phone_addrs.send_replace(addrs.clone());
+                    }
+                } else {
+                    let name = seen.endpoint.as_ref().map(|e| e.name.clone()).unwrap_or_default();
+                    match s.targets.iter_mut().find(|t| matches!(t, Target::Computer { key, .. } if *key == seen.key)) {
+                        Some(Target::Computer { addrs, .. }) => *addrs = seen.addrs,
+                        _ => {
+                            let at = s.targets.iter().position(|t| matches!(t, Target::Bluetooth(_))).unwrap_or(s.targets.len());
+                            s.targets.insert(at, Target::Computer { key: seen.key, name, addrs: seen.addrs });
+                        }
+                    }
+                }
+            }
+            // keep the highlight on what it was on (or on the first, untouched)
+            if !s.chosen {
+                self.sel = if s.touched {
+                    before.and_then(|b| s.targets.iter().position(|t| t.name() == b)).unwrap_or(self.sel).min(s.targets.len().saturating_sub(1))
+                } else {
+                    0
+                };
+            }
             while let Ok(u) = s.rx.try_recv() {
                 match u {
                     Update::Via(wifi, to) => {
@@ -575,41 +686,64 @@ fn choose_with_taco() -> Vec<PathBuf> {
     std::fs::read_to_string(&out).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect()
 }
 
-/// Quick Share if the phone shows up on the network after the nudge, else Bluetooth.
-async fn route_and_send(files: Vec<PathBuf>, paired: Option<Phone>, tx: mpsc::Sender<Update>) -> Result<(), String> {
-    let wifi = lumbre::wifi();
-    picha::send::log(&format!("send {} file(s) · wifi {:?} · lumbre {}", files.len(), wifi.and_then(|w| w.network), lumbre::is_on()));
-    let r = route_and_send_inner(files, paired, tx).await;
-    picha::send::log(&format!("result: {r:?}"));
-    r
+fn paired_name(targets: &[Target]) -> Option<String> {
+    targets.iter().find_map(|t| if let Target::Bluetooth(p) = t { Some(p.name.clone()) } else { None })
 }
 
-async fn route_and_send_inner(files: Vec<PathBuf>, paired: Option<Phone>, tx: mpsc::Sender<Update>) -> Result<(), String> {
-    use picha::wire::{DeviceKind, Endpoint};
-    let found = picha::send::find_phone(Duration::from_secs(10)).await;
-    if let Err(picha::send::Miss::Refused) = found {
-        let _ = tx.send(Update::Why(picha::send::Miss::Refused));
-    }
-    if let Ok((stream, _addr, endpoint)) = found {
-        let to = endpoint.map(|e| e.name).or_else(|| paired.as_ref().map(|p| p.name.clone())).unwrap_or_else(|| "cel".into());
-        let _ = tx.send(Update::Via(true, to));
-        let me = Endpoint { name: Config::load().name(), kind: DeviceKind::Laptop };
-        let (ptx, mut prx) = tokio::sync::mpsc::channel::<picha::send::Progress>(64);
-        let fwd = tx.clone();
-        tokio::spawn(async move {
-            while let Some((i, sent, total)) = prx.recv().await {
-                let _ = fwd.send(Update::Progress(i, sent, total));
+/// Quick Share to a computer; to the phone, Quick Share on whichever address it
+/// answers (waiting for its live announcement), else Bluetooth.
+async fn route_and_send(
+    files: Vec<PathBuf>,
+    target: Target,
+    paired: Option<Phone>,
+    mut phone_addrs: tokio::sync::watch::Receiver<Vec<std::net::SocketAddr>>,
+    tx: mpsc::Sender<Update>,
+) -> Result<(), String> {
+    let name = target.name().to_string();
+    let stream = match &target {
+        Target::Bluetooth(phone) => return send_bluetooth(&files, phone, &tx).await,
+        Target::Computer { addrs, .. } => {
+            picha::send::dial(addrs).await.map_err(|_| format!("{name} didn't answer (is picha recibe running there?)"))?.0
+        }
+        Target::Phone { .. } => {
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let mut tried = Vec::new();
+            let mut refused = false;
+            loop {
+                let new: Vec<_> = phone_addrs.borrow_and_update().iter().filter(|a| !tried.contains(*a)).copied().collect();
+                tried.extend(&new);
+                match picha::send::dial(&new).await {
+                    Ok((stream, _)) => break stream,
+                    Err(picha::send::Miss::Refused) => refused = true,
+                    Err(_) => {}
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() || !matches!(tokio::time::timeout(left, phone_addrs.changed()).await, Ok(Ok(()))) {
+                    if refused {
+                        let _ = tx.send(Update::Why(picha::send::Miss::Refused));
+                    }
+                    let phone = paired.ok_or("the phone didn't answer, and none is paired over Bluetooth")?;
+                    return send_bluetooth(&files, &phone, &tx).await;
+                }
             }
-        });
-        let pin_tx = tx.clone();
-        return picha::send::send(stream, &me, &files, move |pin| drop(pin_tx.send(Update::Pin(pin.to_string()))), Some(ptx))
-            .await
-            .map_err(|e| e.to_string());
-    }
-    let phone = match paired {
-        Some(p) => p,
-        None => bt::phones().await.into_iter().next().ok_or("no phone found, on the network or paired over Bluetooth")?,
+        }
     };
+    let _ = tx.send(Update::Via(true, name));
+    let me = picha::wire::Endpoint { name: Config::load().name(), kind: picha::wire::DeviceKind::Laptop };
+    let (ptx, mut prx) = tokio::sync::mpsc::channel::<picha::send::Progress>(64);
+    let fwd = tx.clone();
+    tokio::spawn(async move {
+        while let Some((i, sent, total)) = prx.recv().await {
+            let _ = fwd.send(Update::Progress(i, sent, total));
+        }
+    });
+    let pin_tx = tx.clone();
+    picha::send::send(stream, &me, &files, move |pin| drop(pin_tx.send(Update::Pin(pin.to_string()))), Some(ptx))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn send_bluetooth(files: &[PathBuf], phone: &Phone, tx: &mpsc::Sender<Update>) -> Result<(), String> {
     picha::send::log(&format!("bluetooth to {} {}", phone.name, phone.address));
     let _ = tx.send(Update::Via(false, phone.name.clone()));
     let (ptx, mut prx) = tokio::sync::mpsc::channel::<bt::SendProgress>(64);
@@ -619,7 +753,7 @@ async fn route_and_send_inner(files: Vec<PathBuf>, paired: Option<Phone>, tx: mp
             let _ = fwd.send(Update::Progress(i, sent, total));
         }
     });
-    bt::send(&phone.address, &files, ptx).await.map_err(|e| e.to_string())
+    bt::send(&phone.address, files, ptx).await.map_err(|e| e.to_string())
 }
 
 pub async fn run(lang: Lang, start: Start) -> io::Result<()> {
@@ -813,15 +947,19 @@ fn draw_pick(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
 }
 
 fn draw_sending(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
-    let (th, lang) = (&app.theme, app.lang);
     let Some(s) = &app.sending else {
-        return lang.t("enter volver", "enter back");
+        return app.lang.t("enter volver", "enter back");
     };
+    if !s.chosen {
+        return draw_picker(f, app, area);
+    }
+    let (th, lang) = (&app.theme, app.lang);
     let (i, sent, total) = s.progress;
+    let to = s.via.as_ref().map(|v| v.1.clone()).unwrap_or_default();
     let mut lines = vec![match &s.via {
         None => Line::from(vec![
             Span::styled(format!("{} ", spinner(th, s.started)), th.acc),
-            Span::styled(th.case(lang.t("buscando el cel…", "looking for the phone…")), th.fg),
+            Span::styled(th.case(lang.t("conectando…", "connecting…")), th.fg),
         ]),
         Some((wifi, to)) => Line::from(vec![
             Span::styled(th.case(&format!("{} ", lang.t("a", "to"))), th.dim),
@@ -839,7 +977,7 @@ fn draw_sending(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
         lines.push(Line::styled(th.case(lang.t("¿Quick Share apagado en el cel?", "Quick Share off on the phone?")), th.dim));
     }
     if let Some(pin) = &s.pin {
-        lines.push(Line::styled(th.case(&format!("PIN {pin} · {}", lang.t("el mismo que en el cel", "same as on the phone"))), th.acc2));
+        lines.push(Line::styled(th.case(&format!("PIN {pin} · {}", lang.t("el mismo que allá", "the same as over there"))), th.acc2));
     }
     lines.push(Line::default());
     for (n, file) in s.files.iter().enumerate() {
@@ -858,9 +996,11 @@ fn draw_sending(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
             let mut bar = th.bar(frac, area.width.saturating_sub(14).min(30), th.acc.remove_modifier(Modifier::BOLD));
             bar.push(Span::styled(format!(" {}", size(sent)), th.fg));
             lines.push(Line::from(bar));
-            lines.push(Line::styled(th.case(lang.t("acepta en el cel", "accept on the phone")), th.dim));
+            if s.via.is_some() {
+                lines.push(Line::styled(th.case(&format!("{} {to}", lang.t("acepta en", "accept on"))), th.dim));
+            }
         }
-        Some(Ok(())) => lines.push(Line::styled(th.case(lang.t("listo, ya está en el cel", "done, it's on the phone")), th.acc)),
+        Some(Ok(())) => lines.push(Line::styled(th.case(&format!("{} {to}", lang.t("listo, ya está en", "done, it's on"))), th.acc)),
         Some(Err(e)) => {
             lines.push(Line::styled(th.case(lang.t("no se pudo mandar", "couldn't send")), th.warn));
             lines.push(Line::styled(e.clone(), th.dim));
@@ -868,6 +1008,54 @@ fn draw_sending(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
     }
     f.render_widget(Paragraph::new(lines), area);
     if s.result.is_some() { lang.t("enter volver · q salir", "enter back · q quit") } else { lang.t("q salir", "q quit") }
+}
+
+/// Where to: the targets as they're found, the files below.
+fn draw_picker(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {
+    let (th, lang) = (&app.theme, app.lang);
+    let Some(s) = &app.sending else { return "" };
+    let looking = s.started.elapsed() < Duration::from_secs(15);
+    let mut head = vec![Span::styled(th.case(lang.t("¿a dónde?", "where to?")), th.fg)];
+    if looking {
+        head.push(Span::styled(format!("  {} ", spinner(th, s.started)), th.acc));
+        head.push(Span::styled(th.case(lang.t("buscando…", "looking…")), th.dim));
+    }
+    f.render_widget(Paragraph::new(Line::from(head)), Rect::new(area.x, area.y, area.width, 1));
+    let mut y = area.y + 2;
+    let rows: Vec<(String, String)> = s
+        .targets
+        .iter()
+        .map(|t| match t {
+            Target::Phone { name, .. } => (format!("{}{name}", icon(th, "󰄜")), lang.t("Quick Share, rápido", "Quick Share, fast").to_string()),
+            Target::Computer { name, .. } => (format!("{}{name}", icon(th, "󰍹")), lang.t("Quick Share, rápido", "Quick Share, fast").to_string()),
+            Target::Bluetooth(p) => (format!("{}{}", icon(th, "󰂯"), p.name), lang.t("por Bluetooth, lento", "over Bluetooth, slow").to_string()),
+        })
+        .collect();
+    let files = s.files.len();
+    if rows.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::styled(th.case(lang.t("nada todavía: ¿el cel desbloqueado, la otra compu con picha?", "nothing yet: phone unlocked, the other computer running picha?")), th.dim)),
+            Rect::new(area.x, y, area.width, 1),
+        );
+        y += 1;
+    }
+    for (n, (label, how)) in rows.into_iter().enumerate() {
+        if y >= area.bottom() {
+            break;
+        }
+        let rect = Rect::new(area.x, y, area.width, 1);
+        let mut line = app.theme.choice(&label, app.sel == n, true);
+        line.push(Span::styled(app.theme.case(&format!("  · {how}")), app.theme.dim));
+        f.render_widget(Paragraph::new(Line::from(line)), rect);
+        app.rows.push((rect, n));
+        y += 1;
+    }
+    let th = &app.theme;
+    if y + 1 < area.bottom() {
+        let what = if files == 1 { lang.t("1 archivo", "1 file").to_string() } else { format!("{files} {}", lang.t("archivos", "files")) };
+        f.render_widget(Paragraph::new(Line::styled(th.case(&what), th.dim)), Rect::new(area.x, y + 1, area.width, 1));
+    }
+    lang.t("↑↓ elegir · enter mandar · esc volver", "↑↓ pick · enter send · esc back")
 }
 
 fn draw_receive(f: &mut Frame, app: &mut App, area: Rect) -> &'static str {

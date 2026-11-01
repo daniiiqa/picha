@@ -132,22 +132,30 @@ pub fn log(what: &str) {
     }
 }
 
-/// Why no phone was reached over the network.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Miss {
-    /// Nothing answered on the network: not on the same Wi-Fi, or asleep.
-    NotSeen,
-    /// It announced itself but refused the connection: Quick Share is off on it.
-    Refused,
+/// A Quick Share receiver announced on the network: a phone woken by the nudge, or
+/// another computer running picha (or Quick Share for Windows).
+#[derive(Debug, Clone)]
+pub struct Seen {
+    /// its mDNS name (phones change it on every wake-up)
+    pub key: String,
+    /// how it describes itself; hidden phones give none
+    pub endpoint: Option<Endpoint>,
+    /// IPv4 first, then IPv6 (link-local ones scoped to their interface)
+    pub addrs: Vec<SocketAddr>,
 }
 
-/// Nudges nearby phones over Bluetooth LE and waits up to `wait` for one to show up
-/// on the network as a Quick Share receiver: a connection to it, its address and how
-/// it describes itself (hidden phones give no name). Not this laptop's own receiver.
-/// A phone can still answer mDNS with a port it no longer serves (its announcement
-/// from before the nudge), so each candidate is dialed and a refusal means keep
-/// waiting for the live one.
-pub async fn find_phone(wait: std::time::Duration) -> std::result::Result<(TcpStream, SocketAddr, Option<Endpoint>), Miss> {
+impl Seen {
+    /// A phone or tablet, or one that won't say (Android hides its name until it
+    /// has accepted something from us): these go in "the phone" row.
+    pub fn is_phone(&self) -> bool {
+        self.endpoint.as_ref().is_none_or(|e| matches!(e.kind, crate::wire::DeviceKind::Phone | crate::wire::DeviceKind::Tablet))
+    }
+}
+
+/// Nudges nearby phones over Bluetooth LE and, for `wait`, reports every Quick
+/// Share receiver that shows up on the network (not this laptop's own) to `found`.
+/// Stops early when `found` is closed.
+pub async fn discover(wait: std::time::Duration, found: tokio::sync::mpsc::UnboundedSender<Seen>) {
     use base64::Engine;
     use mdns_sd::{ServiceDaemon, ServiceEvent};
 
@@ -161,13 +169,16 @@ pub async fn find_phone(wait: std::time::Duration) -> std::result::Result<(TcpSt
             None
         }
     };
-    let mdns = ServiceDaemon::new().map_err(|_| Miss::NotSeen)?;
-    let events = mdns.browse("_FC9F5ED42C8A._tcp.local.").map_err(|_| Miss::NotSeen)?;
-    let mut refused = false;
+    let Ok(mdns) = ServiceDaemon::new() else { return };
+    let Ok(events) = mdns.browse("_FC9F5ED42C8A._tcp.local.") else { return };
     let me = crate::config::Config::load();
     let deadline = std::time::Instant::now() + wait;
-    let mut found = None;
-    while let Ok(event) = tokio::task::block_in_place(|| events.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))) {
+    while !found.is_closed() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_millis(500));
+        if left.is_zero() {
+            break;
+        }
+        let Ok(event) = tokio::task::block_in_place(|| events.recv_timeout(left)) else { continue };
         let ServiceEvent::ServiceResolved(info) = event else { continue };
         let raw = info
             .get_property_val_str("n")
@@ -184,8 +195,6 @@ pub async fn find_phone(wait: std::time::Duration) -> std::result::Result<(TcpSt
         if endpoint.as_ref().is_some_and(|e| e.name == me.name()) && info.get_port() == me.port() {
             continue;
         }
-        // IPv4 first; then IPv6, which on a network without internet (the lumbre) can
-        // be the only one the phone's server accepts.
         let port = info.get_port();
         let mut addrs: Vec<SocketAddr> =
             info.get_addresses_v4().into_iter().map(|ip| SocketAddr::new(std::net::IpAddr::V4(ip), port)).collect();
@@ -196,27 +205,41 @@ pub async fn find_phone(wait: std::time::Duration) -> std::result::Result<(TcpSt
             }
             _ => None,
         }));
-        for addr in addrs {
-            match tokio::time::timeout(std::time::Duration::from_secs(2), TcpStream::connect(addr)).await {
-                Ok(Ok(stream)) => {
-                    found = Some((stream, addr, endpoint.clone()));
-                    break;
-                }
-                Ok(Err(e)) => {
-                    refused = true;
-                    log(&format!("dial {addr}: {e} (trying the next address)"));
-                }
-                Err(_) => log(&format!("dial {addr}: timed out")),
-            }
-        }
-        if found.is_some() {
-            break;
-        }
+        let _ = found.send(Seen { key: info.get_fullname().to_string(), endpoint, addrs });
     }
-    log(&format!("find_phone: {:?}", found.as_ref().map(|f| f.1)));
     let _ = mdns.shutdown();
     if let Some(n) = nudge {
         n.stop().await;
     }
-    found.ok_or(if refused { Miss::Refused } else { Miss::NotSeen })
+}
+
+/// Why dialing got nowhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Miss {
+    /// Nothing answered: not on the same network, or asleep.
+    NotSeen,
+    /// It announced itself but refused the connection: Quick Share is off on it.
+    /// (A phone can also answer mDNS with a port it no longer serves.)
+    Refused,
+}
+
+/// The first of `addrs` that takes a connection (2 s each).
+pub async fn dial(addrs: &[SocketAddr]) -> std::result::Result<(TcpStream, SocketAddr), Miss> {
+    let mut miss = Miss::NotSeen;
+    for &addr in addrs {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => {
+                log(&format!("dial {addr}: connected"));
+                return Ok((stream, addr));
+            }
+            Ok(Err(e)) => {
+                if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                    miss = Miss::Refused;
+                }
+                log(&format!("dial {addr}: {e}"));
+            }
+            Err(_) => log(&format!("dial {addr}: timed out")),
+        }
+    }
+    Err(miss)
 }
