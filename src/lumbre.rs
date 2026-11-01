@@ -74,11 +74,49 @@ fn previous_file() -> std::path::PathBuf {
     crate::state::dir().join("lumbre-antes")
 }
 
+fn radio_off_file() -> std::path::PathBuf {
+    crate::state::dir().join("lumbre-sin-radio")
+}
+
+/// Whether airplane mode (an rfkill soft block) has the Wi-Fi radio off.
+fn radio_blocked() -> bool {
+    let Ok(dir) = std::fs::read_dir("/sys/class/rfkill") else { return false };
+    dir.flatten().any(|e| {
+        let read = |f: &str| std::fs::read_to_string(e.path().join(f)).unwrap_or_default();
+        read("type").trim() == "wlan" && read("soft").trim() == "1"
+    })
+}
+
+fn rfkill(action: &str) -> Result<()> {
+    let ok = Command::new("rfkill").args([action, "wifi"]).stdin(Stdio::null()).status().is_ok_and(|s| s.success());
+    if ok { Ok(()) } else { Err(protocol(format!("rfkill {action} wifi failed"))) }
+}
+
+/// Waits (up to 10 s) for NetworkManager to see the card again after the radio comes on.
+fn wait_for_card() -> Option<Wifi> {
+    for _ in 0..40 {
+        let available = nmcli(&["-t", "-f", "TYPE,STATE", "device"])
+            .is_ok_and(|o| o.lines().any(|l| l.starts_with("wifi:") && !l.ends_with(":unavailable")));
+        if available {
+            return wifi();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    None
+}
+
 /// Lights it: leaves the current Wi-Fi (remembered for `stop`) and opens the lumbre.
+/// Airplane mode is the usual way to be "without network", so if the radio is off it
+/// turns it on for the lumbre (and `stop` turns it back off).
 pub fn start() -> Result<Lumbre> {
+    let _ = std::fs::create_dir_all(crate::state::dir());
+    if radio_blocked() {
+        rfkill("unblock")?;
+        let _ = std::fs::write(radio_off_file(), "");
+        wait_for_card().ok_or_else(|| protocol("the Wi-Fi card didn't come back after leaving airplane mode"))?;
+    }
     let card = wifi().ok_or_else(|| protocol("no Wi-Fi card"))?;
     if let Some(net) = &card.network {
-        let _ = std::fs::create_dir_all(crate::state::dir());
         let _ = std::fs::write(previous_file(), net);
     }
     let l = Lumbre::get();
@@ -88,10 +126,15 @@ pub fn start() -> Result<Lumbre> {
     Ok(l)
 }
 
-/// Puts it out and goes back to the Wi-Fi the laptop was on.
+/// Puts it out and goes back to how the laptop was: its Wi-Fi, or airplane mode.
 pub fn stop() -> Result<()> {
     if is_on() {
         nmcli(&["connection", "down", CONNECTION])?;
+    }
+    if radio_off_file().exists() {
+        let _ = std::fs::remove_file(radio_off_file());
+        let _ = std::fs::remove_file(previous_file());
+        return rfkill("block");
     }
     if let Ok(previous) = std::fs::read_to_string(previous_file()) {
         let _ = std::fs::remove_file(previous_file());
