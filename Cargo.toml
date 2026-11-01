@@ -1,6 +1,6 @@
 [package]
 name = "picha"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Quick Share for Linux: your Android phone te picha files, a la carne asada"
 license = "MIT"
