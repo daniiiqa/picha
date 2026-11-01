@@ -1,6 +1,6 @@
 # Maintainer: daniiiqa
 pkgname=picha
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Your Android phone and your laptop, like Huawei Share: Quick Share, Bluetooth, its screen, from the terminal'
 arch=('x86_64' 'aarch64')
@@ -18,7 +18,7 @@ optdepends=(
   'ttf-nerd-fonts-symbols: icons in the menu'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('57b75c912ef8b814e38d8371391f16afca9c4598dc5fc49fd789f29af32bae5a')
+sha256sums=('98c1c724779c2112ff132c3f57bf796504acc41601d5d8e8bf3d61fde9c40aed')
 
 prepare() {
   cd "$pkgname-$pkgver"
