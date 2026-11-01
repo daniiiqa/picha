@@ -102,6 +102,7 @@ async fn finish(session: Connection, transfer: OwnedObjectPath, name: String, si
                 if let Some(f) = &stored {
                     let _ = tokio::fs::remove_file(f).await;
                 }
+                let _ = events.send(Event::Ended).await;
                 return;
             }
             Ok(_) => {}
@@ -117,20 +118,22 @@ async fn finish(session: Connection, transfer: OwnedObjectPath, name: String, si
                 if let Some(f) = &stored {
                     let _ = tokio::fs::remove_file(f).await;
                 }
+                let _ = events.send(Event::Ended).await;
                 return;
             }
         }
     }
-    let Some(from) = stored else { return };
+    let Some(from) = stored else {
+        let _ = events.send(Event::Ended).await;
+        return;
+    };
     let to = unique_path(&dir, &name);
     // rename fails across filesystems; copy then remove covers that.
     let moved = match tokio::fs::rename(&from, &to).await {
         Ok(()) => Ok(()),
         Err(_) => tokio::fs::copy(&from, &to).await.and(tokio::fs::remove_file(&from).await),
     };
-    if moved.is_ok() {
-        let _ = events.send(Event::Files(vec![to])).await;
-    }
+    let _ = events.send(if moved.is_ok() { Event::Files(vec![to]) } else { Event::Ended }).await;
 }
 
 /// Keeps picha registered with obexd while alive.

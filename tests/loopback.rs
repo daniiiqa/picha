@@ -83,3 +83,18 @@ async fn rejecting_leaves_nothing_behind() {
     assert!(saved.is_empty());
     assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
 }
+
+#[test]
+fn activity_file_lives_while_the_transfer_does() {
+    let dir = std::env::temp_dir().join(format!("picha-activity-{}", std::process::id()));
+    // SAFETY: this test process sets it before any thread reads it
+    unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+    let mut a = picha::state::Activity::new(true, "Daniel's\nS21");
+    a.progress(50, 200);
+    let files: Vec<_> = std::fs::read_dir(dir.join("picha")).unwrap().flatten().collect();
+    assert_eq!(files.len(), 1);
+    assert_eq!(std::fs::read_to_string(files[0].path()).unwrap(), "in 25 Daniel's S21\n");
+    drop(a);
+    assert_eq!(std::fs::read_dir(dir.join("picha")).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

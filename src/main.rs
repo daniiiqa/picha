@@ -205,6 +205,8 @@ async fn serve_events(mut events: mpsc::Receiver<Event>, lang: Lang) -> bool {
     let mut shown = 0;
     let mut offered = false;
     let mut from = String::new();
+    // for the bar, while files come in
+    let mut activity: Option<picha::state::Activity> = None;
     while let Some(event) = events.recv().await {
         match event {
             Event::Offer(offer, answer) => {
@@ -227,9 +229,13 @@ async fn serve_events(mut events: mpsc::Receiver<Event>, lang: Lang) -> bool {
                     }
                 };
                 println!("picha: {}", if accepted { lang.t("aceptado", "accepted") } else { lang.t("rechazado", "rejected") });
+                activity = accepted.then(|| picha::state::Activity::new(true, &from));
                 let _ = answer.send(accepted);
             }
             Event::Progress { received, total } => {
+                if let Some(a) = activity.as_mut() {
+                    a.progress(received, total);
+                }
                 let pct = (received * 100).checked_div(total).unwrap_or(100);
                 if pct >= shown + 10 || (pct == 100 && shown < 100) {
                     shown = pct;
@@ -238,10 +244,13 @@ async fn serve_events(mut events: mpsc::Receiver<Event>, lang: Lang) -> bool {
             }
             // Their notifications wait for a click; don't hold the connection for them.
             Event::Files(paths) => {
+                activity = None;
                 picha::state::record(&from, &paths);
                 tokio::spawn(files_arrived(paths, lang));
             }
+            Event::Ended => activity = None,
             Event::Text(kind, text) => {
+                activity = None;
                 tokio::spawn(text_arrived(kind, text, lang));
             }
         }

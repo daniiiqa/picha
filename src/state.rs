@@ -92,3 +92,54 @@ pub fn set_hidden(on: bool) {
         let _ = fs::remove_file(hidden_file());
     }
 }
+
+/// A transfer in progress, for the bar (empalme's `picha` module): one file per
+/// transfer in $XDG_RUNTIME_DIR/picha, named `<pid>-<n>`, holding one line:
+/// `in|out <percent> <who>`. Gone when the transfer ends (dropped).
+pub struct Activity {
+    path: PathBuf,
+    incoming: bool,
+    who: String,
+    pct: u64,
+}
+
+fn activity_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("picha")
+}
+
+impl Activity {
+    pub fn new(incoming: bool, who: &str) -> Activity {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = fs::create_dir_all(activity_dir());
+        let path = activity_dir().join(format!("{}-{n}", std::process::id()));
+        // one line, no newlines from a phone's name
+        let who = who.replace(['\n', '\r'], " ");
+        let a = Activity { path, incoming, who, pct: 0 };
+        a.write();
+        a
+    }
+
+    /// Updates the percentage (written only when it changes).
+    pub fn progress(&mut self, done: u64, total: u64) {
+        let pct = (done.saturating_mul(100)).checked_div(total).unwrap_or(0).min(100);
+        if pct != self.pct {
+            self.pct = pct;
+            self.write();
+        }
+    }
+
+    fn write(&self) {
+        let tmp = self.path.with_extension("tmp");
+        let line = format!("{} {} {}\n", if self.incoming { "in" } else { "out" }, self.pct, self.who);
+        if fs::write(&tmp, line).is_ok() {
+            let _ = fs::rename(&tmp, &self.path);
+        }
+    }
+}
+
+impl Drop for Activity {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}

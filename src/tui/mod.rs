@@ -96,6 +96,8 @@ struct Sending {
     /// None while looking for the phone.
     via: Option<(bool, String)>,
     why: Option<picha::send::Miss>,
+    /// for the bar (empalme), while it goes
+    activity: Option<picha::state::Activity>,
     pin: Option<String>,
     progress: (usize, u64, u64),
     rx: mpsc::Receiver<Update>,
@@ -353,7 +355,7 @@ impl App {
             let done = route_and_send(list, paired, tx.clone()).await;
             let _ = tx.send(Update::Done(done));
         });
-        self.sending = Some(Sending { files, started: Instant::now(), via: None, why: None, pin: None, progress: (0, 0, 0), rx, result: None });
+        self.sending = Some(Sending { files, started: Instant::now(), via: None, why: None, activity: None, pin: None, progress: (0, 0, 0), rx, result: None });
     }
 
     fn pick_open(&mut self) {
@@ -518,11 +520,22 @@ impl App {
         if let Some(s) = self.sending.as_mut() {
             while let Ok(u) = s.rx.try_recv() {
                 match u {
-                    Update::Via(wifi, to) => s.via = Some((wifi, to)),
+                    Update::Via(wifi, to) => {
+                        s.activity = Some(picha::state::Activity::new(false, &to));
+                        s.via = Some((wifi, to));
+                    }
                     Update::Why(why) => s.why = Some(why),
                     Update::Pin(pin) => s.pin = Some(pin),
-                    Update::Progress(i, sent, total) => s.progress = (i, sent, total),
-                    Update::Done(r) => s.result = Some(r),
+                    Update::Progress(i, sent, total) => {
+                        if let Some(a) = s.activity.as_mut() {
+                            a.progress(sent, total);
+                        }
+                        s.progress = (i, sent, total);
+                    }
+                    Update::Done(r) => {
+                        s.activity = None;
+                        s.result = Some(r);
+                    }
                 }
             }
         }

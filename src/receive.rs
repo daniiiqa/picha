@@ -68,6 +68,8 @@ pub enum Event {
     Progress { received: u64, total: u64 },
     Files(Vec<PathBuf>),
     Text(TextKind, String),
+    /// It stopped without delivering anything (cancelled or failed).
+    Ended,
 }
 
 /// The files (by payload id) and text an offer announced, kept until the user answers.
